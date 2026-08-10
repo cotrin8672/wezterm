@@ -1,0 +1,16 @@
+min_version: 2.1.10
+assert_lefthook_installed: true
+
+pre-commit:
+  piped: true
+  jobs:
+    - name: protect main from direct commits
+      only:
+        - ref: main
+      run: |
+        if ! git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null; then
+          echo "Direct commits to main are blocked; cherry-pick a verified topic commit instead."
+          exit 1
+        fi
+    - name: validate commit
+      run: mise run commit-check
