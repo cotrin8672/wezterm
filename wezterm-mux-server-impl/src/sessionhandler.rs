@@ -830,7 +830,7 @@ impl SessionHandler {
                             let (_, lines) = pane.get_lines(line_idx..line_idx + 1);
                             'found_data: for line in lines {
                                 if let Some(cell) = line.get_cell(cell_idx) {
-                                    if let Some(images) = cell.attrs().images() {
+                                    if let Some(images) = cell.attrs().images_ref() {
                                         for im in images {
                                             if im.image_data().hash() == data_hash {
                                                 data.replace(im.image_data().clone());
@@ -974,7 +974,7 @@ impl SessionHandler {
                                     return Err(anyhow!(
                                         "Failed to retrieve tab with ID {}",
                                         tab_id
-                                    ))
+                                    ));
                                 }
                             };
 

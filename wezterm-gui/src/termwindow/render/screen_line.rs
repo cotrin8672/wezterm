@@ -433,7 +433,7 @@ impl crate::TermWindow {
         for item in shaped.iter() {
             let cluster = &item.cluster;
             let glyph_info = &item.glyph_info;
-            let images = cluster.attrs.images().unwrap_or_else(|| vec![]);
+            let images = cluster.attrs.images_ref().unwrap_or(&[]);
             let valign_adjust = match cluster.attrs.vertical_align() {
                 termwiz::cell::VerticalAlign::BaseLine => 0.,
                 termwiz::cell::VerticalAlign::SuperScript => {
@@ -469,10 +469,10 @@ impl crate::TermWindow {
                 }
 
                 for glyph_idx in 0..info.pos.num_cells as usize {
-                    for img in &images {
+                    for img in images {
                         if img.z_index() < 0 {
                             self.populate_image_quad(
-                                &img,
+                                img,
                                 gl_state,
                                 layers,
                                 0,
@@ -664,7 +664,7 @@ impl crate::TermWindow {
                 }
 
                 for glyph_idx in 0..info.pos.num_cells as usize {
-                    for img in &images {
+                    for img in images {
                         if img.z_index() >= 0 {
                             overlay_images.push((
                                 visual_cell_idx + glyph_idx,

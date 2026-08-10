@@ -23,10 +23,11 @@ impl VecStorage {
     pub(crate) fn set_cell(&mut self, idx: usize, mut cell: Cell, clear_image_placement: bool) {
         #[cfg(feature = "use_image")]
         if !clear_image_placement {
-            if let Some(images) = self.cells[idx].attrs().images() {
+            if let Some(images) = self.cells[idx].attrs().images_ref() {
                 for image in images {
                     if image.should_preserve_on_cell_update() {
-                        cell.attrs_mut().attach_image(Box::new(image));
+                        cell.attrs_mut()
+                            .attach_image(Box::new(image.as_ref().clone()));
                     }
                 }
             }

@@ -27,8 +27,13 @@ pub struct KittyImageState {
     id_to_data: HashMap<u32, Arc<ImageData>>,
     placements: HashMap<(u32, Option<u32>), PlacementInfo>,
     virtual_placements: Vec<KittyVirtualPlacement>,
-    next_virtual_placement_order: u64,
     used_memory: usize,
+    #[cfg(test)]
+    placeholder_scan_count: usize,
+    #[cfg(test)]
+    placeholder_cell_scan_count: usize,
+    #[cfg(test)]
+    placeholder_attachment_update_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -40,7 +45,165 @@ struct KittyVirtualPlacement {
     image_width: u32,
     image_height: u32,
     data: Arc<ImageData>,
-    order: u64,
+}
+
+struct KittyPlaceholderGeometry {
+    columns: u32,
+    rows: u32,
+    rendered_width: f64,
+    rendered_height: f64,
+    image_left: f64,
+    image_top: f64,
+}
+
+struct PreparedKittyVirtualPlacement {
+    image_id: u32,
+    placement_id: Option<u32>,
+    data: Arc<ImageData>,
+    cell_width: usize,
+    cell_height: usize,
+    geometry: Option<KittyPlaceholderGeometry>,
+}
+
+impl PreparedKittyVirtualPlacement {
+    fn new(placement: &KittyVirtualPlacement, cell_width: usize, cell_height: usize) -> Self {
+        let geometry = (|| {
+            if cell_width == 0
+                || cell_height == 0
+                || placement.image_width == 0
+                || placement.image_height == 0
+            {
+                return None;
+            }
+            let cell_width_u32 = u32::try_from(cell_width).ok()?;
+            let cell_height_u32 = u32::try_from(cell_height).ok()?;
+            let columns = if placement.columns == 0 {
+                placement.image_width.div_ceil(cell_width_u32)
+            } else {
+                placement.columns
+            };
+            let rows = if placement.rows == 0 {
+                placement.image_height.div_ceil(cell_height_u32)
+            } else {
+                placement.rows
+            };
+            if columns == 0 || rows == 0 {
+                return None;
+            }
+
+            let grid_width = f64::from(columns) * cell_width as f64;
+            let grid_height = f64::from(rows) * cell_height as f64;
+            let scale = (grid_width / f64::from(placement.image_width))
+                .min(grid_height / f64::from(placement.image_height));
+            if !scale.is_finite() || scale <= 0.0 {
+                return None;
+            }
+            let rendered_width = f64::from(placement.image_width) * scale;
+            let rendered_height = f64::from(placement.image_height) * scale;
+            Some(KittyPlaceholderGeometry {
+                columns,
+                rows,
+                rendered_width,
+                rendered_height,
+                image_left: (grid_width - rendered_width) / 2.0,
+                image_top: (grid_height - rendered_height) / 2.0,
+            })
+        })();
+
+        Self {
+            image_id: placement.image_id,
+            placement_id: placement.placement_id,
+            data: Arc::clone(&placement.data),
+            cell_width,
+            cell_height,
+            geometry,
+        }
+    }
+
+    fn image_cell(&self, row: u32, column: u32) -> Option<ImageCell> {
+        let geometry = self.geometry.as_ref()?;
+        if column >= geometry.columns || row >= geometry.rows {
+            return None;
+        }
+
+        let cell_left = f64::from(column) * self.cell_width as f64;
+        let cell_top = f64::from(row) * self.cell_height as f64;
+        let cell_right = cell_left + self.cell_width as f64;
+        let cell_bottom = cell_top + self.cell_height as f64;
+        let left = cell_left.max(geometry.image_left);
+        let top = cell_top.max(geometry.image_top);
+        let right = cell_right.min(geometry.image_left + geometry.rendered_width);
+        let bottom = cell_bottom.min(geometry.image_top + geometry.rendered_height);
+        if left >= right || top >= bottom {
+            return None;
+        }
+
+        let padding = |value: f64, maximum: usize| value.round().clamp(0.0, maximum as f64) as u16;
+        Some(ImageCell::with_attachment_kind(
+            TextureCoordinate::new_f32(
+                ((left - geometry.image_left) / geometry.rendered_width) as f32,
+                ((top - geometry.image_top) / geometry.rendered_height) as f32,
+            ),
+            TextureCoordinate::new_f32(
+                ((right - geometry.image_left) / geometry.rendered_width) as f32,
+                ((bottom - geometry.image_top) / geometry.rendered_height) as f32,
+            ),
+            Arc::clone(&self.data),
+            -1,
+            padding(left - cell_left, self.cell_width),
+            padding(top - cell_top, self.cell_height),
+            padding(cell_right - right, self.cell_width),
+            padding(cell_bottom - bottom, self.cell_height),
+            Some(self.image_id),
+            self.placement_id,
+            ImageCellAttachmentKind::KittyUnicodePlaceholder,
+        ))
+    }
+}
+
+struct KittyPlaceholderPlacementLookup {
+    placements: Vec<PreparedKittyVirtualPlacement>,
+    latest_by_image_id: HashMap<u32, usize>,
+    exact_by_placement_id: HashMap<(u32, u32), usize>,
+}
+
+impl KittyPlaceholderPlacementLookup {
+    fn new(placements: &[KittyVirtualPlacement], cell_width: usize, cell_height: usize) -> Self {
+        let mut result = Self {
+            placements: Vec::with_capacity(placements.len()),
+            latest_by_image_id: HashMap::with_capacity(placements.len()),
+            exact_by_placement_id: HashMap::with_capacity(placements.len()),
+        };
+        for placement in placements {
+            let idx = result.placements.len();
+            result.placements.push(PreparedKittyVirtualPlacement::new(
+                placement,
+                cell_width,
+                cell_height,
+            ));
+            result.latest_by_image_id.insert(placement.image_id, idx);
+            if let Some(placement_id) = placement.placement_id {
+                result
+                    .exact_by_placement_id
+                    .insert((placement.image_id, placement_id), idx);
+            }
+        }
+        result
+    }
+
+    fn resolve(
+        &self,
+        image_id: u32,
+        requested_placement_id: u32,
+    ) -> Option<&PreparedKittyVirtualPlacement> {
+        let idx = if requested_placement_id == 0 {
+            self.latest_by_image_id.get(&image_id)
+        } else {
+            self.exact_by_placement_id
+                .get(&(image_id, requested_placement_id))
+        }?;
+        self.placements.get(*idx)
+    }
 }
 
 const KITTY_UNICODE_PLACEHOLDER: char = '\u{10eeee}';
@@ -164,8 +327,8 @@ impl KittyImageState {
 
 fn kitty_diacritic_index(ch: char) -> Option<u32> {
     KITTY_ROW_COLUMN_DIACRITICS
-        .iter()
-        .position(|candidate| *candidate == ch as u32)
+        .binary_search(&(ch as u32))
+        .ok()
         .map(|idx| idx as u32)
 }
 
@@ -200,20 +363,22 @@ fn decode_kitty_placeholder_cell(
     if chars.next() != Some(KITTY_UNICODE_PLACEHOLDER) {
         return None;
     }
-    let marks: Vec<Option<u32>> = chars.take(3).map(kitty_diacritic_index).collect();
-    let mut row = marks.first().copied().flatten().unwrap_or(0);
-    let mut column = marks.get(1).copied().flatten().unwrap_or(0);
-    let mut high = marks
-        .get(2)
-        .copied()
-        .flatten()
+    let mut marks = [None; 3];
+    let mut mark_count = 0;
+    for ch in chars.take(3) {
+        marks[mark_count] = kitty_diacritic_index(ch);
+        mark_count += 1;
+    }
+    let mut row = marks[0].unwrap_or(0);
+    let mut column = marks[1].unwrap_or(0);
+    let mut high = marks[2]
         .filter(|value| *value <= u8::MAX as u32)
         .unwrap_or(0);
 
     if let Some(left) =
         previous.filter(|left| left.foreground == foreground && left.underline == underline)
     {
-        match marks.len() {
+        match mark_count {
             0 => {
                 column = left.column.checked_add(1)?;
                 row = left.row;
@@ -241,6 +406,7 @@ fn decode_kitty_placeholder_cell(
     })
 }
 
+#[cfg(test)]
 fn kitty_placeholder_image_cell(
     placement: &KittyVirtualPlacement,
     row: u32,
@@ -248,72 +414,7 @@ fn kitty_placeholder_image_cell(
     cell_width: usize,
     cell_height: usize,
 ) -> Option<ImageCell> {
-    if cell_width == 0
-        || cell_height == 0
-        || placement.image_width == 0
-        || placement.image_height == 0
-    {
-        return None;
-    }
-    let cell_width_u32 = u32::try_from(cell_width).ok()?;
-    let cell_height_u32 = u32::try_from(cell_height).ok()?;
-    let columns = if placement.columns == 0 {
-        placement.image_width.div_ceil(cell_width_u32)
-    } else {
-        placement.columns
-    };
-    let rows = if placement.rows == 0 {
-        placement.image_height.div_ceil(cell_height_u32)
-    } else {
-        placement.rows
-    };
-    if columns == 0 || rows == 0 || column >= columns || row >= rows {
-        return None;
-    }
-
-    let grid_width = f64::from(columns) * cell_width as f64;
-    let grid_height = f64::from(rows) * cell_height as f64;
-    let scale = (grid_width / f64::from(placement.image_width))
-        .min(grid_height / f64::from(placement.image_height));
-    if !scale.is_finite() || scale <= 0.0 {
-        return None;
-    }
-    let rendered_width = f64::from(placement.image_width) * scale;
-    let rendered_height = f64::from(placement.image_height) * scale;
-    let image_left = (grid_width - rendered_width) / 2.0;
-    let image_top = (grid_height - rendered_height) / 2.0;
-    let cell_left = f64::from(column) * cell_width as f64;
-    let cell_top = f64::from(row) * cell_height as f64;
-    let cell_right = cell_left + cell_width as f64;
-    let cell_bottom = cell_top + cell_height as f64;
-    let left = cell_left.max(image_left);
-    let top = cell_top.max(image_top);
-    let right = cell_right.min(image_left + rendered_width);
-    let bottom = cell_bottom.min(image_top + rendered_height);
-    if left >= right || top >= bottom {
-        return None;
-    }
-
-    let padding = |value: f64, maximum: usize| value.round().clamp(0.0, maximum as f64) as u16;
-    Some(ImageCell::with_attachment_kind(
-        TextureCoordinate::new_f32(
-            ((left - image_left) / rendered_width) as f32,
-            ((top - image_top) / rendered_height) as f32,
-        ),
-        TextureCoordinate::new_f32(
-            ((right - image_left) / rendered_width) as f32,
-            ((bottom - image_top) / rendered_height) as f32,
-        ),
-        Arc::clone(&placement.data),
-        -1,
-        padding(left - cell_left, cell_width),
-        padding(top - cell_top, cell_height),
-        padding(cell_right - right, cell_width),
-        padding(cell_bottom - bottom, cell_height),
-        Some(placement.image_id),
-        placement.placement_id,
-        ImageCellAttachmentKind::KittyUnicodePlaceholder,
-    ))
+    PreparedKittyVirtualPlacement::new(placement, cell_width, cell_height).image_cell(row, column)
 }
 
 impl TerminalState {
@@ -321,66 +422,142 @@ impl TerminalState {
         !self.kitty_img.virtual_placements.is_empty()
     }
 
-    pub(crate) fn refresh_kitty_unicode_placeholders(&mut self) {
-        let placements = self.kitty_img.virtual_placements.clone();
-        let columns = self.screen().physical_cols.max(1);
-        let rows = self.screen().physical_rows.max(1);
-        let cell_width = self.pixel_width / columns;
-        let cell_height = self.pixel_height / rows;
-        let seqno = self.seqno;
+    fn refresh_kitty_unicode_placeholder_line(
+        line: &mut wezterm_surface::Line,
+        placements: &KittyPlaceholderPlacementLookup,
+        seqno: wezterm_surface::SequenceNo,
+        force_scan: bool,
+    ) -> (usize, usize) {
+        if !force_scan && !line.has_kitty_unicode_placeholder() {
+            return (0, 0);
+        }
 
-        self.screen_mut().for_each_phys_line_mut(|_, line| {
-            if !line.has_kitty_unicode_placeholder() {
-                return;
-            }
+        let mut previous: Option<PlaceholderRunCell> = None;
+        let mut has_placeholder = false;
+        let mut attachment_updates = 0;
+        let cells = line.cells_mut();
+        let cells_scanned = cells.len();
 
-            let cells = line.cells_mut();
-            for cell in cells.iter_mut() {
-                cell.attrs_mut()
-                    .detach_images_by_kind(ImageCellAttachmentKind::KittyUnicodePlaceholder);
-            }
-
-            let mut previous: Option<PlaceholderRunCell> = None;
-            let mut attachments = Vec::new();
-            for (cell_idx, cell) in cells.iter().enumerate() {
-                let foreground = cell.attrs().foreground();
-                let underline = cell.attrs().underline_color();
-                let Some(run) =
-                    decode_kitty_placeholder_cell(cell.str(), foreground, underline, previous)
-                else {
-                    previous = None;
-                    continue;
-                };
+        for cell in cells.iter_mut() {
+            let foreground = cell.attrs().foreground();
+            let underline = cell.attrs().underline_color();
+            let run = decode_kitty_placeholder_cell(cell.str(), foreground, underline, previous);
+            let replacement = if let Some(run) = run {
+                has_placeholder = true;
                 previous = Some(run);
-
                 let image_id = kitty_color_id(foreground) | (run.high << 24);
                 let requested_placement = kitty_color_id(underline);
-                let placement = placements
-                    .iter()
-                    .filter(|placement| {
-                        placement.image_id == image_id
-                            && (requested_placement == 0
-                                || placement.placement_id == Some(requested_placement))
-                    })
-                    .max_by_key(|placement| placement.order);
-                if let Some(placement) = placement {
-                    if let Some(image_cell) = kitty_placeholder_image_cell(
-                        placement,
-                        run.row,
-                        run.column,
-                        cell_width,
-                        cell_height,
-                    ) {
-                        attachments.push((cell_idx, image_cell));
-                    }
-                }
-            }
+                placements
+                    .resolve(image_id, requested_placement)
+                    .and_then(|placement| placement.image_cell(run.row, run.column))
+            } else {
+                previous = None;
+                None
+            };
 
-            for (cell_idx, image) in attachments {
-                cells[cell_idx].attrs_mut().attach_image(Box::new(image));
+            if cell.attrs_mut().replace_image_by_kind(
+                ImageCellAttachmentKind::KittyUnicodePlaceholder,
+                replacement,
+            ) {
+                attachment_updates += 1;
             }
+        }
+
+        line.set_kitty_unicode_placeholder_flag(has_placeholder);
+        if attachment_updates > 0 {
             line.update_last_change_seqno(seqno);
+        }
+        (cells_scanned, attachment_updates)
+    }
+
+    fn kitty_placeholder_refresh_geometry(&self) -> (usize, usize) {
+        let columns = self.screen().physical_cols.max(1);
+        let rows = self.screen().physical_rows.max(1);
+        (self.pixel_width / columns, self.pixel_height / rows)
+    }
+
+    pub(crate) fn refresh_kitty_unicode_placeholders(&mut self) {
+        let (cell_width, cell_height) = self.kitty_placeholder_refresh_geometry();
+        let placements = KittyPlaceholderPlacementLookup::new(
+            &self.kitty_img.virtual_placements,
+            cell_width,
+            cell_height,
+        );
+        let seqno = self.seqno;
+        let mut _scan_count = 0;
+        let mut _cell_scan_count = 0;
+        let mut _attachment_update_count = 0;
+
+        self.screen_mut().for_each_phys_line_mut(|_, line| {
+            let (cells_scanned, attachments_updated) =
+                Self::refresh_kitty_unicode_placeholder_line(line, &placements, seqno, false);
+            if cells_scanned > 0 {
+                _scan_count += 1;
+                _cell_scan_count += cells_scanned;
+                _attachment_update_count += attachments_updated;
+            }
         });
+
+        #[cfg(test)]
+        {
+            self.kitty_img.placeholder_scan_count += _scan_count;
+            self.kitty_img.placeholder_cell_scan_count += _cell_scan_count;
+            self.kitty_img.placeholder_attachment_update_count += _attachment_update_count;
+        }
+    }
+
+    pub(crate) fn refresh_kitty_unicode_placeholders_in_stable_rows(
+        &mut self,
+        stable_rows: &HashSet<StableRowIndex>,
+    ) {
+        if stable_rows.is_empty() {
+            return;
+        }
+
+        let (cell_width, cell_height) = self.kitty_placeholder_refresh_geometry();
+        let placements = KittyPlaceholderPlacementLookup::new(
+            &self.kitty_img.virtual_placements,
+            cell_width,
+            cell_height,
+        );
+        let seqno = self.seqno;
+        let physical_rows: Vec<_> = stable_rows
+            .iter()
+            .filter_map(|stable| self.screen().stable_row_to_phys(*stable))
+            .collect();
+        let mut _scan_count = 0;
+        let mut _cell_scan_count = 0;
+        let mut _attachment_update_count = 0;
+
+        for physical_row in physical_rows {
+            let (cells_scanned, attachments_updated) = Self::refresh_kitty_unicode_placeholder_line(
+                self.screen_mut().line_mut(physical_row),
+                &placements,
+                seqno,
+                true,
+            );
+            if cells_scanned > 0 {
+                _scan_count += 1;
+                _cell_scan_count += cells_scanned;
+                _attachment_update_count += attachments_updated;
+            }
+        }
+
+        #[cfg(test)]
+        {
+            self.kitty_img.placeholder_scan_count += _scan_count;
+            self.kitty_img.placeholder_cell_scan_count += _cell_scan_count;
+            self.kitty_img.placeholder_attachment_update_count += _attachment_update_count;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kitty_placeholder_refresh_stats(&self) -> (usize, usize, usize) {
+        (
+            self.kitty_img.placeholder_scan_count,
+            self.kitty_img.placeholder_cell_scan_count,
+            self.kitty_img.placeholder_attachment_update_count,
+        )
     }
 
     fn kitty_img_place(
@@ -428,8 +605,6 @@ impl TerminalState {
                     candidate.image_id != image_id || candidate.placement_id != placement_id
                 });
             }
-            let order = self.kitty_img.next_virtual_placement_order;
-            self.kitty_img.next_virtual_placement_order = order.saturating_add(1);
             self.kitty_img
                 .virtual_placements
                 .push(KittyVirtualPlacement {
@@ -440,7 +615,6 @@ impl TerminalState {
                     image_width,
                     image_height,
                     data: img,
-                    order,
                 });
             self.refresh_kitty_unicode_placeholders();
             return Ok(());
@@ -1591,7 +1765,6 @@ mod unicode_placeholder_test {
             image_width: 20,
             image_height: 10,
             data,
-            order: 0,
         };
         let top = kitty_placeholder_image_cell(&placement, 0, 0, 10, 10).unwrap();
         assert_eq!(top.padding(), (0, 5, 0, 0));

@@ -2,11 +2,14 @@ use crate::terminal::{Alert, Progress};
 use crate::terminalstate::{
     default_color_map, CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry,
 };
-use crate::{ClipboardSelection, Position, TerminalState, VisibleRowIndex, DCS, ST};
+use crate::{
+    ClipboardSelection, Position, StableRowIndex, TerminalState, VisibleRowIndex, DCS, ST,
+};
 use finl_unicode::grapheme_clusters::Graphemes;
 use log::{debug, error};
 use num_traits::FromPrimitive;
 use ordered_float::NotNan;
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::io::Write as _;
 use std::ops::{Deref, DerefMut};
@@ -18,7 +21,7 @@ use wezterm_cell::{
     grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
 };
 use wezterm_escape_parser::csi::{
-    CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
+    CharacterPath, Edit, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
 };
 use wezterm_escape_parser::osc::{
     ChangeColorPair, ColorOrQuery, FinalTermSemanticPrompt, ITermProprietary,
@@ -33,6 +36,8 @@ use wezterm_escape_parser::{
 pub(crate) struct Performer<'a> {
     pub state: &'a mut TerminalState,
     print: String,
+    kitty_placeholder_dirty_rows: HashSet<StableRowIndex>,
+    kitty_placeholder_full_refresh: bool,
 }
 
 impl<'a> Deref for Performer<'a> {
@@ -52,6 +57,7 @@ impl<'a> DerefMut for Performer<'a> {
 impl<'a> Drop for Performer<'a> {
     fn drop(&mut self) {
         self.flush_print();
+        self.reconcile_kitty_unicode_placeholders();
     }
 }
 
@@ -60,7 +66,41 @@ impl<'a> Performer<'a> {
         Self {
             state,
             print: String::new(),
+            kitty_placeholder_dirty_rows: HashSet::new(),
+            kitty_placeholder_full_refresh: false,
         }
+    }
+
+    fn reconcile_kitty_unicode_placeholders(&mut self) {
+        if !self.kitty_placeholder_dirty_rows.is_empty() {
+            self.state
+                .refresh_kitty_unicode_placeholders_in_stable_rows(
+                    &self.kitty_placeholder_dirty_rows,
+                );
+        }
+        if self.kitty_placeholder_full_refresh {
+            self.state.refresh_kitty_unicode_placeholders();
+        }
+        self.kitty_placeholder_dirty_rows.clear();
+        self.kitty_placeholder_full_refresh = false;
+    }
+
+    fn mark_partial_width_scroll_rows_dirty(&mut self) {
+        if self.left_and_right_margins.start == 0
+            && self.left_and_right_margins.end == self.screen().physical_cols
+        {
+            return;
+        }
+        let affected_rows: Vec<_> = {
+            let screen = self.screen();
+            (0..screen.physical_rows as VisibleRowIndex)
+                .map(|visible_row| {
+                    let physical_row = screen.phys_row(visible_row);
+                    screen.phys_to_stable_row_index(physical_row)
+                })
+                .collect()
+        };
+        self.kitty_placeholder_dirty_rows.extend(affected_rows);
     }
 
     /// Apply character set related remapping to the input glyph if required
@@ -130,11 +170,8 @@ impl<'a> Performer<'a> {
         } else {
             p.as_str()
         };
-        let mut saw_kitty_unicode_placeholder = false;
-
         for g in Graphemes::new(text) {
             let g = self.remap_grapheme(g);
-            saw_kitty_unicode_placeholder |= g.starts_with('\u{10eeee}');
 
             let mut print_width = grapheme_column_width(g, Some(&self.unicode_version));
             if print_width == 0 {
@@ -193,12 +230,29 @@ impl<'a> Performer<'a> {
                         screen.line_mut(y).set_last_cell_was_wrapped(true, seqno);
                     }
                 }
+                self.reconcile_kitty_unicode_placeholders();
                 self.new_line(true);
+                self.mark_partial_width_scroll_rows_dirty();
             }
 
             let x = self.cursor.x;
             let y = self.cursor.y;
             let width = self.left_and_right_margins.end;
+
+            let placeholder_stable_row = {
+                let screen = self.screen();
+                let physical_row = screen.phys_row(y);
+                if g.starts_with('\u{10eeee}')
+                    || screen.line(physical_row).has_kitty_unicode_placeholder()
+                {
+                    Some(screen.phys_to_stable_row_index(physical_row))
+                } else {
+                    None
+                }
+            };
+            if let Some(stable_row) = placeholder_stable_row {
+                self.kitty_placeholder_dirty_rows.insert(stable_row);
+            }
 
             let pen = self.pen.clone();
 
@@ -231,10 +285,6 @@ impl<'a> Performer<'a> {
             } else {
                 self.wrap_next = self.dec_auto_wrap;
             }
-        }
-
-        if saw_kitty_unicode_placeholder || self.has_kitty_virtual_placements() {
-            self.refresh_kitty_unicode_placeholders();
         }
 
         std::mem::swap(&mut self.print, &mut p);
@@ -281,12 +331,7 @@ impl<'a> Performer<'a> {
             Action::DeviceControl(ctrl) => self.device_control(ctrl),
             Action::OperatingSystemCommand(osc) => self.osc_dispatch(*osc),
             Action::Esc(esc) => self.esc_dispatch(esc),
-            Action::CSI(csi) => {
-                self.csi_dispatch(csi);
-                if self.has_kitty_virtual_placements() {
-                    self.refresh_kitty_unicode_placeholders();
-                }
-            }
+            Action::CSI(csi) => self.csi_dispatch(csi),
             Action::Sixel(sixel) => self.sixel(sixel),
             Action::XtGetTcap(names) => self.xt_get_tcap(names),
             Action::KittyImage(img) => {
@@ -387,6 +432,18 @@ impl<'a> Performer<'a> {
         let seqno = self.seqno;
         self.pop_tmux_title_state();
         self.flush_print();
+        let may_scroll = matches!(
+            control,
+            ControlCode::LineFeed
+                | ControlCode::VerticalTab
+                | ControlCode::FormFeed
+                | ControlCode::IND
+                | ControlCode::NEL
+                | ControlCode::RI
+        );
+        if may_scroll {
+            self.reconcile_kitty_unicode_placeholders();
+        }
         match control {
             ControlCode::LineFeed | ControlCode::VerticalTab | ControlCode::FormFeed => {
                 if self.left_and_right_margins.contains(&self.cursor.x) {
@@ -497,11 +554,44 @@ impl<'a> Performer<'a> {
                 }
             }
         }
+        if may_scroll {
+            self.mark_partial_width_scroll_rows_dirty();
+        }
     }
 
     fn csi_dispatch(&mut self, csi: CSI) {
         self.pop_tmux_title_state();
         self.flush_print();
+        let line_scroll = matches!(
+            &csi,
+            CSI::Edit(
+                Edit::DeleteLine(_) | Edit::InsertLine(_) | Edit::ScrollDown(_) | Edit::ScrollUp(_),
+            )
+        );
+        let may_switch_screen = matches!(&csi, CSI::Mode(_));
+        if line_scroll || may_switch_screen {
+            self.reconcile_kitty_unicode_placeholders();
+        }
+        let was_alt_screen = self.state.screen.alt_screen_is_active;
+        let may_scroll_cells = line_scroll || matches!(&csi, CSI::Edit(Edit::Repeat(_)));
+        let partial_width_scroll = may_scroll_cells
+            && (self.left_and_right_margins.start != 0
+                || self.left_and_right_margins.end != self.screen().physical_cols);
+        let kitty_edit_row = match &csi {
+            CSI::Edit(
+                Edit::DeleteCharacter(_)
+                | Edit::EraseCharacter(_)
+                | Edit::EraseInLine(_)
+                | Edit::InsertCharacter(_),
+            ) => {
+                let screen = self.screen();
+                let physical_row = screen.phys_row(self.cursor.y);
+                Some(screen.phys_to_stable_row_index(physical_row))
+            }
+            _ => None,
+        };
+        let kitty_full_refresh =
+            matches!(&csi, CSI::Edit(Edit::EraseInDisplay(_) | Edit::Repeat(_)));
         match csi {
             CSI::Sgr(sgr) => self.state.perform_csi_sgr(sgr),
             CSI::Cursor(wezterm_escape_parser::csi::Cursor::Left(n)) => {
@@ -591,11 +681,28 @@ impl<'a> Performer<'a> {
                 }
             }
         };
+        if partial_width_scroll {
+            self.mark_partial_width_scroll_rows_dirty();
+        }
+        if may_switch_screen && was_alt_screen != self.state.screen.alt_screen_is_active {
+            self.state.refresh_kitty_unicode_placeholders();
+        }
+        if let Some(stable_row) = kitty_edit_row {
+            self.kitty_placeholder_dirty_rows.insert(stable_row);
+        }
+        self.kitty_placeholder_full_refresh |= kitty_full_refresh;
     }
 
     fn esc_dispatch(&mut self, esc: Esc) {
         let seqno = self.seqno;
         self.flush_print();
+        let may_scroll = matches!(
+            &esc,
+            Esc::Code(EscCode::ReverseIndex | EscCode::Index | EscCode::NextLine)
+        );
+        if may_scroll {
+            self.reconcile_kitty_unicode_placeholders();
+        }
         if esc != Esc::Code(EscCode::StringTerminator) {
             self.pop_tmux_title_state();
         }
@@ -742,6 +849,9 @@ impl<'a> Performer<'a> {
                     log::warn!("ESC: unhandled {:?}", esc);
                 }
             }
+        }
+        if may_scroll {
+            self.mark_partial_width_scroll_rows_dirty();
         }
     }
 

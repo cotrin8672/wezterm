@@ -74,9 +74,14 @@ impl PartialEq for Line {
 
 impl Line {
     pub fn with_width_and_cell(width: usize, cell: Cell, seqno: SequenceNo) -> Self {
+        let has_kitty_placeholder = cell.str().starts_with('\u{10eeee}');
         let mut cells = Vec::with_capacity(width);
         cells.resize(width, cell.clone());
-        let bits = LineBits::NONE;
+        let bits = if has_kitty_placeholder {
+            LineBits::HAS_KITTY_UNICODE_PLACEHOLDER
+        } else {
+            LineBits::NONE
+        };
         Self {
             bits,
             cells: CellStorage::V(VecStorage::new(cells)),
@@ -88,7 +93,14 @@ impl Line {
     }
 
     pub fn from_cells(cells: Vec<Cell>, seqno: SequenceNo) -> Self {
-        let bits = LineBits::NONE;
+        let bits = if cells
+            .iter()
+            .any(|cell| cell.str().starts_with('\u{10eeee}'))
+        {
+            LineBits::HAS_KITTY_UNICODE_PLACEHOLDER
+        } else {
+            LineBits::NONE
+        };
         Self {
             bits,
             cells: CellStorage::V(VecStorage::new(cells)),
@@ -162,14 +174,16 @@ impl Line {
             }
         }
 
-        Line {
+        let mut line = Line {
             cells: CellStorage::V(VecStorage::new(cells)),
             bits: LineBits::NONE,
             seqno,
             zones: vec![],
             #[cfg(feature = "appdata")]
             appdata: Mutex::new(None),
-        }
+        };
+        line.recompute_kitty_unicode_placeholder_flag();
+        line
     }
 
     pub fn from_text_with_wrapped_last_col(
@@ -733,14 +747,7 @@ impl Line {
             }
             cells.push(c.as_cell());
         }
-        Self {
-            bits: LineBits::NONE,
-            cells: CellStorage::V(VecStorage::new(cells)),
-            seqno: self.current_seqno(),
-            zones: vec![],
-            #[cfg(feature = "appdata")]
-            appdata: Mutex::new(None),
-        }
+        Self::from_cells(cells, self.current_seqno())
     }
 
     /// If we're about to modify a cell obscured by a double-width
@@ -797,9 +804,23 @@ impl Line {
 
     pub fn has_kitty_unicode_placeholder(&self) -> bool {
         self.bits.contains(LineBits::HAS_KITTY_UNICODE_PLACEHOLDER)
-            || self
-                .visible_cells()
-                .any(|cell| cell.str().starts_with('\u{10eeee}'))
+    }
+
+    /// Recompute and return the exact placeholder state for this line.
+    pub fn recompute_kitty_unicode_placeholder_flag(&mut self) -> bool {
+        let has_placeholder = self
+            .visible_cells()
+            .any(|cell| cell.str().starts_with('\u{10eeee}'));
+        self.set_kitty_unicode_placeholder_flag(has_placeholder);
+        has_placeholder
+    }
+
+    pub fn set_kitty_unicode_placeholder_flag(&mut self, has_placeholder: bool) {
+        if has_placeholder {
+            self.bits |= LineBits::HAS_KITTY_UNICODE_PLACEHOLDER;
+        } else {
+            self.bits.remove(LineBits::HAS_KITTY_UNICODE_PLACEHOLDER);
+        }
     }
 
     pub fn set_cell_clearing_image_placements(

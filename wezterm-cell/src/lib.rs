@@ -394,6 +394,36 @@ impl CellAttributes {
         self.deallocate_fat_attributes_if_none();
     }
 
+    /// Replace the image attachment of `kind` only when its value changed.
+    ///
+    /// Returns true when the attributes were mutated.  This is useful for
+    /// derived image attachments that may be recomputed frequently: callers
+    /// can avoid dirtying a line when the resulting image slice is unchanged.
+    pub fn replace_image_by_kind(
+        &mut self,
+        kind: image::ImageCellAttachmentKind,
+        replacement: Option<ImageCell>,
+    ) -> bool {
+        let unchanged = self.fat.as_ref().map_or(replacement.is_none(), |fat| {
+            let mut matching = fat.image.iter().filter(|im| im.attachment_kind() == kind);
+            let first = matching.next();
+            match (first, matching.next(), replacement.as_ref()) {
+                (None, None, None) => true,
+                (Some(existing), None, Some(replacement)) => existing.as_ref() == replacement,
+                _ => false,
+            }
+        });
+        if unchanged {
+            return false;
+        }
+
+        self.detach_images_by_kind(kind);
+        if let Some(image) = replacement {
+            self.attach_image(Box::new(image));
+        }
+        true
+    }
+
     /// Add an image attachement, preserving any existing attachments.
     /// The list of images is maintained in z-index order
     pub fn attach_image(&mut self, image: Box<ImageCell>) -> &mut Self {
@@ -482,6 +512,17 @@ impl CellAttributes {
             return None;
         }
         Some(fat.image.iter().map(|im| im.as_ref().clone()).collect())
+    }
+
+    /// Borrow the attached images without cloning their vector or contents.
+    #[cfg(feature = "use_image")]
+    pub fn images_ref(&self) -> Option<&[Box<ImageCell>]> {
+        let fat = self.fat.as_ref()?;
+        if fat.image.is_empty() {
+            None
+        } else {
+            Some(&fat.image)
+        }
     }
 
     pub fn underline_color(&self) -> ColorAttribute {
@@ -1007,6 +1048,58 @@ pub enum AttributeChange {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[cfg(feature = "use_image")]
+    fn test_image(kind: crate::image::ImageCellAttachmentKind, image_id: u32) -> ImageCell {
+        use crate::image::{ImageData, ImageDataType, TextureCoordinate};
+
+        ImageCell::with_attachment_kind(
+            TextureCoordinate::new_f32(0.0, 0.0),
+            TextureCoordinate::new_f32(1.0, 1.0),
+            Arc::new(ImageData::with_data(ImageDataType::placeholder())),
+            -1,
+            0,
+            0,
+            0,
+            0,
+            Some(image_id),
+            Some(2),
+            kind,
+        )
+    }
+
+    #[test]
+    #[cfg(feature = "use_image")]
+    fn replace_image_by_kind_avoids_noop_allocations_and_preserves_other_images() {
+        use crate::image::ImageCellAttachmentKind::{KittyUnicodePlaceholder, Normal};
+
+        let mut attrs = CellAttributes::default();
+        attrs.attach_image(Box::new(test_image(Normal, 9)));
+        let placeholder = test_image(KittyUnicodePlaceholder, 1);
+
+        assert!(attrs.replace_image_by_kind(KittyUnicodePlaceholder, Some(placeholder.clone())));
+        assert!(!attrs.replace_image_by_kind(KittyUnicodePlaceholder, Some(placeholder)));
+        assert_eq!(attrs.images_ref().unwrap().len(), 2);
+
+        assert!(attrs.replace_image_by_kind(
+            KittyUnicodePlaceholder,
+            Some(test_image(KittyUnicodePlaceholder, 2)),
+        ));
+        let images = attrs.images_ref().unwrap();
+        assert!(
+            images
+                .iter()
+                .any(|image| image.attachment_kind() == Normal && image.image_id() == Some(9))
+        );
+        assert!(images.iter().any(|image| {
+            image.attachment_kind() == KittyUnicodePlaceholder && image.image_id() == Some(2)
+        }));
+
+        assert!(attrs.replace_image_by_kind(KittyUnicodePlaceholder, None));
+        let images = attrs.images_ref().unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].attachment_kind(), Normal);
+    }
 
     #[test]
     fn teeny_string() {

@@ -110,6 +110,240 @@ fn kitty_unicode_placeholder_attaches_image_without_replacing_text() {
 }
 
 #[test]
+fn kitty_placeholder_refresh_is_batched_per_input_chunk() {
+    let mut term = TestTerm::new(3, 20, 0);
+    let transmit = format!(
+        "\x1b_Ga=T,t=d,f=100,i=1,U=1,c=1,r=1,q=2;{}\x1b\\",
+        TINY_PNG_BASE64
+    );
+    term.print(transmit);
+    let before = term.term.kitty_placeholder_refresh_stats();
+
+    // Snacks changes SGR state around placeholder runs.  All four cells are
+    // written to the same line in one PTY chunk and must be reconciled once,
+    // rather than once for every intervening CSI/print flush.
+    let placeholder = "\u{10eeee}\u{0305}\u{0305}";
+    let redraw = format!(
+        "\x1b[38;5;1m{placeholder}\x1b[4:0m{placeholder}\x1b[39m\x1b[38;5;1m{placeholder}{placeholder}"
+    );
+    term.print(redraw);
+
+    let after = term.term.kitty_placeholder_refresh_stats();
+    k9::assert_equal!(after.0 - before.0, 1);
+    k9::assert_equal!(after.1 - before.1, 4);
+    k9::assert_equal!(after.2 - before.2, 4);
+}
+
+#[test]
+fn kitty_placeholder_cursor_and_sgr_traffic_does_not_scan_lines() {
+    let mut term = TestTerm::new(3, 20, 1000);
+    let transmit = format!(
+        "\x1b_Ga=T,t=d,f=100,i=1,U=1,c=1,r=1,q=2;{}\x1b\\",
+        TINY_PNG_BASE64
+    );
+    term.print(transmit);
+    term.print("\x1b[38;5;1m\u{10eeee}\u{0305}\u{0305}".as_bytes());
+    let before = term.term.kitty_placeholder_refresh_stats();
+
+    let mut tui_traffic = String::new();
+    for idx in 0..500 {
+        // Cursor positioning and SGR dominate a Neovim redraw but do not
+        // mutate terminal cells, so they must not invoke the scanner.
+        tui_traffic.push_str("\x1b[1;1H");
+        tui_traffic.push_str(if idx % 2 == 0 {
+            "\x1b[38;5;2m"
+        } else {
+            "\x1b[39m"
+        });
+    }
+    term.print(tui_traffic);
+
+    k9::assert_equal!(term.term.kitty_placeholder_refresh_stats(), before);
+}
+
+#[test]
+fn kitty_placeholder_noop_refresh_does_not_rebuild_attachments() {
+    let mut term = TestTerm::new(2, 8, 0);
+    let transmit = format!(
+        "\x1b_Ga=T,t=d,f=100,i=1,U=1,c=1,r=1,q=2;{}\x1b\\",
+        TINY_PNG_BASE64
+    );
+    term.print(transmit);
+    term.print("\x1b[38;5;1m\u{10eeee}\u{0305}\u{0305}".as_bytes());
+    let before = term.term.kitty_placeholder_refresh_stats();
+
+    term.term.refresh_kitty_unicode_placeholders();
+
+    let after = term.term.kitty_placeholder_refresh_stats();
+    k9::assert_equal!(after.0 - before.0, 1);
+    k9::assert_equal!(after.2, before.2);
+}
+
+#[test]
+fn kitty_placeholder_overwrite_clears_line_candidate_bit() {
+    let mut term = TestTerm::new(2, 8, 0);
+    let transmit = format!(
+        "\x1b_Ga=T,t=d,f=100,i=1,U=1,c=1,r=1,q=2;{}\x1b\\",
+        TINY_PNG_BASE64
+    );
+    term.print(transmit);
+    term.print("\x1b[38;5;1m\u{10eeee}\u{0305}\u{0305}".as_bytes());
+    term.print("\rX");
+    let after_overwrite = term.term.kitty_placeholder_refresh_stats();
+
+    // EL force-scans its affected row so that direct cell-slice mutations can
+    // repair a false-negative line flag.  The cleared row is scanned once,
+    // but must not recreate an attachment.
+    term.print("\x1b[2K");
+    let after_edit = term.term.kitty_placeholder_refresh_stats();
+    k9::assert_equal!(after_edit.0 - after_overwrite.0, 1);
+    k9::assert_equal!(after_edit.1 - after_overwrite.1, 8);
+    k9::assert_equal!(after_edit.2, after_overwrite.2);
+}
+
+#[test]
+fn kitty_placeholder_line_edit_scans_only_the_affected_row() {
+    let mut term = TestTerm::new(3, 8, 0);
+    let transmit = format!(
+        "\x1b_Ga=T,t=d,f=100,i=1,U=1,c=1,r=1,q=2;{}\x1b\\",
+        TINY_PNG_BASE64
+    );
+    term.print(transmit);
+    let placeholder = "\x1b[38;5;1m\u{10eeee}\u{0305}\u{0305}";
+    term.print(format!("{placeholder}\r\n{placeholder}"));
+    let before = term.term.kitty_placeholder_refresh_stats();
+
+    // EL is common in Neovim redraws.  It changes only the cursor row, so it
+    // must not scan the other placeholder row or the rest of scrollback.
+    term.print("\x1b[1;1H\x1b[2K");
+
+    let after = term.term.kitty_placeholder_refresh_stats();
+    k9::assert_equal!(after.0 - before.0, 1);
+    assert!(term.term.screen().visible_lines()[1]
+        .visible_cells()
+        .next()
+        .unwrap()
+        .attrs()
+        .images()
+        .is_some());
+}
+
+#[test]
+fn kitty_placeholder_scroll_moves_attachments_without_rescanning() {
+    let mut term = TestTerm::new(3, 8, 1000);
+    let transmit = format!(
+        "\x1b_Ga=T,t=d,f=100,i=1,U=1,c=1,r=1,q=2;{}\x1b\\",
+        TINY_PNG_BASE64
+    );
+    term.print(transmit);
+    term.print("\x1b[38;5;1m\u{10eeee}\u{0305}\u{0305}".as_bytes());
+    let before = term.term.kitty_placeholder_refresh_stats();
+
+    let mut scrolling = String::new();
+    for _ in 0..500 {
+        scrolling.push_str("\x1b[1S\x1b[1T");
+    }
+    term.print(scrolling);
+
+    k9::assert_equal!(term.term.kitty_placeholder_refresh_stats(), before);
+}
+
+#[test]
+fn kitty_placeholder_is_reconciled_before_same_chunk_scroll() {
+    let mut term = TestTerm::new(2, 8, 0);
+    let transmit = format!(
+        "\x1b_Ga=T,t=d,f=100,i=1,U=1,c=1,r=1,q=2;{}\x1b\\",
+        TINY_PNG_BASE64
+    );
+    term.print(transmit);
+
+    // The LF scrolls immediately after the placeholder was buffered in the
+    // same advance_bytes call.  Reconcile must happen before the stable-row
+    // mapping changes so that the image moves with the source Line.
+    term.print("\x1b[2;1H\x1b[38;5;1m\u{10eeee}\u{0305}\u{0305}\n".as_bytes());
+
+    let lines = term.term.screen().visible_lines();
+    let first = lines[0].visible_cells().next().unwrap();
+    assert!(first.str().starts_with('\u{10eeee}'));
+    assert!(first.attrs().images().is_some());
+}
+
+#[test]
+fn kitty_placeholder_refreshes_when_switching_screens() {
+    let mut term = TestTerm::new(2, 8, 0);
+    let transmit = format!(
+        "\x1b_Ga=T,t=d,f=100,i=1,U=1,c=1,r=1,q=2;{}\x1b\\",
+        TINY_PNG_BASE64
+    );
+    term.print(transmit);
+
+    // Flush a main-screen placeholder and switch screens in one input chunk.
+    term.print("\x1b[38;5;1m\u{10eeee}\u{0305}\u{0305}\x1b[?1049h".as_bytes());
+    // Deleting while the alternate screen is active refreshes that screen.
+    // Returning to main must also refresh the newly active screen and remove
+    // its stale attachment.
+    term.print("\x1b_Ga=d,d=i,i=1,q=2\x1b\\\x1b[?1049l".as_bytes());
+
+    let lines = term.term.screen().visible_lines();
+    let first = lines[0].visible_cells().next().unwrap();
+    assert!(first.str().starts_with('\u{10eeee}'));
+    assert!(first.attrs().images().is_none());
+}
+
+#[test]
+fn kitty_placeholder_partial_width_scroll_repairs_line_index() {
+    let mut term = TestTerm::new(3, 6, 0);
+    let transmit = format!(
+        "\x1b_Ga=T,t=d,f=100,i=1,U=1,c=1,r=1,q=2;{}\x1b\\",
+        TINY_PNG_BASE64
+    );
+    term.print(transmit);
+
+    // Enable DECLRMM, limit scrolling to columns 2..4, then put the
+    // placeholder on row 2. DL on row 1 copies only a cell slice into a Line
+    // that previously had no placeholder bit.
+    term.print(
+        "\x1b[?69h\x1b[2;4s\x1b[2;2H\x1b[38;5;1m\u{10eeee}\u{0305}\u{0305}\x1b[1;2H\x1b[1M"
+            .as_bytes(),
+    );
+    let lines = term.term.screen().visible_lines();
+    let moved = lines[0].visible_cells().nth(1).unwrap();
+    assert!(moved.str().starts_with('\u{10eeee}'));
+    assert!(moved.attrs().images().is_some());
+
+    // A later lifecycle refresh relies on the repaired line index.  If the
+    // partial-width copy left a false-negative bit, this stale image survives.
+    term.print("\x1b_Ga=d,d=i,i=1,q=2\x1b\\".as_bytes());
+    let lines = term.term.screen().visible_lines();
+    let moved = lines[0].visible_cells().nth(1).unwrap();
+    assert!(moved.attrs().images().is_none());
+}
+
+#[test]
+fn kitty_placeholder_partial_width_linefeed_repairs_line_index() {
+    let mut term = TestTerm::new(2, 6, 0);
+    let transmit = format!(
+        "\x1b_Ga=T,t=d,f=100,i=1,U=1,c=1,r=1,q=2;{}\x1b\\",
+        TINY_PNG_BASE64
+    );
+    term.print(transmit);
+
+    // A linefeed at the bottom margin reaches the same partial-width slice
+    // copy as CSI scrolling, but through new_line().  Both the pre-scroll
+    // stable-row reconcile and the post-scroll forced index repair are needed.
+    term.print("\x1b[?69h\x1b[2;4s\x1b[2;2H\x1b[38;5;1m\u{10eeee}\u{0305}\u{0305}\n".as_bytes());
+    let lines = term.term.screen().visible_lines();
+    let moved = lines[0].visible_cells().nth(1).unwrap();
+    assert!(moved.str().starts_with('\u{10eeee}'));
+    assert!(moved.attrs().images().is_some());
+
+    term.print("\x1b_Ga=d,d=i,i=1,q=2\x1b\\".as_bytes());
+    let lines = term.term.screen().visible_lines();
+    let moved = lines[0].visible_cells().nth(1).unwrap();
+    assert!(moved.attrs().images().is_none());
+}
+
+#[test]
 fn kitty_quiet_mode_applies_to_success_and_error_responses() {
     #[derive(Clone)]
     struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);

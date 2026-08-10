@@ -1063,7 +1063,7 @@ impl From<Vec<(StableRowIndex, Line)>> for SerializedLines {
                     current_range = 0..0;
                 }
 
-                if let Some(cell_images) = cell.attrs().images() {
+                if let Some(cell_images) = cell.attrs().images_ref() {
                     for imcell in cell_images {
                         let (padding_left, padding_top, padding_right, padding_bottom) =
                             imcell.padding();
