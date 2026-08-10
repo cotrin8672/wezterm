@@ -66,3 +66,5 @@ dhat-heap.json
 /__pycache__/
 /nix/result
 *.qcow2
+/lefthook-local.yml
+/mise.local.toml

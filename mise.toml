@@ -1,0 +1,16 @@
+[tools]
+lefthook = "2.1.10"
+rust = { version = "1.97.1", profile = "minimal", components = ["rustfmt"] }
+
+[tasks.fmt-check]
+description = "Check Rust formatting without modifying files"
+tools.rust = "nightly-2026-08-09"
+run = "cargo fmt --all -- --check"
+
+[tasks.build]
+description = "Build the four primary WezTerm binaries"
+run = "cargo build --locked -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes"
+
+[tasks.commit-check]
+description = "Run every check required before creating a commit"
+run = [{ task = "fmt-check" }, { task = "build" }]
