@@ -10,6 +10,12 @@ mise run test-kitty-unicode-placeholder
 The launcher forces Snacks to treat this WezTerm build as supporting Unicode
 placeholders and enables inline document images only for that Neovim process.
 
+To validate the launcher and Snacks environment without opening the UI, run:
+
+```text
+mise run test-kitty-unicode-placeholder -- --check
+```
+
 ## Expected environment
 
 Run this command in Neovim:
