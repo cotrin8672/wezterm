@@ -178,7 +178,7 @@ impl TerminalState {
         }
         let verbosity = img.verbosity();
         match img {
-            KittyImage::Query { transmit } => match transmit.data.load_data() {
+            KittyImage::Query { transmit, .. } => match transmit.data.load_data() {
                 Ok(_) => {
                     self.kitty_send_response(
                         verbosity,
@@ -283,6 +283,9 @@ impl TerminalState {
                 if let Err(err) = self.kitty_frame_compose(frame, verbosity) {
                     log::error!("Error {:#} while handling KittyImage::ComposeFrame", err);
                 }
+            }
+            KittyImage::Invalid { error, .. } => {
+                anyhow::bail!("invalid Kitty graphics command: {error}");
             }
         };
 

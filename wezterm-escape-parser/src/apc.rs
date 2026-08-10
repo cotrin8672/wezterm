@@ -609,11 +609,13 @@ pub struct KittyImagePlacement {
     pub placement_id: Option<u32>,
     /// z=...
     pub z_index: Option<i32>,
+    /// U=1 requests a virtual placement used by Unicode placeholders.
+    pub unicode_placeholder: bool,
 }
 
 impl KittyImagePlacement {
-    fn from_keys(keys: &BTreeMap<&str, &str>) -> Option<Self> {
-        Some(Self {
+    fn from_keys(keys: &BTreeMap<&str, &str>) -> Result<Self, String> {
+        Ok(Self {
             x: geti(keys, "x"),
             y: geti(keys, "y"),
             w: geti(keys, "w"),
@@ -626,9 +628,14 @@ impl KittyImagePlacement {
             do_not_move_cursor: match get(keys, "C") {
                 None | Some("0") => false,
                 Some("1") => true,
-                _ => return None,
+                Some(value) => return Err(format!("C must be 0 or 1, got {value}")),
             },
             z_index: geti(keys, "z"),
+            unicode_placeholder: match get(keys, "U") {
+                None | Some("0") => false,
+                Some("1") => true,
+                Some(value) => return Err(format!("U must be 0 or 1, got {value}")),
+            },
         })
     }
 
@@ -648,6 +655,9 @@ impl KittyImagePlacement {
         }
 
         set(keys, "z", &self.z_index);
+        if self.unicode_placeholder {
+            keys.insert("U", "1".to_string());
+        }
     }
 }
 
@@ -675,6 +685,13 @@ pub enum KittyImageDelete {
     ByImageNumber {
         image_number: u32,
         placement_id: Option<u32>,
+        delete: bool,
+    },
+
+    /// d='r' or d='R'. Delete images whose IDs are in the inclusive range x..=y.
+    ByImageIdRange {
+        first_image_id: u32,
+        last_image_id: u32,
         delete: bool,
     },
 
@@ -733,6 +750,11 @@ impl KittyImageDelete {
             'n' | 'N' => Some(Self::ByImageNumber {
                 image_number: geti(keys, "I")?,
                 placement_id: geti(keys, "p"),
+                delete,
+            }),
+            'r' | 'R' => Some(Self::ByImageIdRange {
+                first_image_id: geti(keys, "x")?,
+                last_image_id: geti(keys, "y")?,
                 delete,
             }),
             'c' | 'C' => Some(Self::AtCursorPosition { delete }),
@@ -794,6 +816,15 @@ impl KittyImageDelete {
                     keys.insert("p", p.to_string());
                 }
                 keys.insert("I", image_number.to_string());
+            }
+            Self::ByImageIdRange {
+                first_image_id,
+                last_image_id,
+                delete,
+            } => {
+                keys.insert("d", d('r', delete));
+                keys.insert("x", first_image_id.to_string());
+                keys.insert("y", last_image_id.to_string());
             }
             Self::AtCursorPosition { delete } => {
                 keys.insert("d", d('c', delete));
@@ -1007,6 +1038,18 @@ impl KittyImageFrame {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KittyImage {
+    /// A Kitty APC was recognized, but could not be validated.  Keeping this
+    /// as an action lets the terminal produce a protocol error instead of
+    /// silently discarding malformed input.
+    Invalid {
+        image_id: Option<u32>,
+        image_number: Option<u32>,
+        placement_id: Option<u32>,
+        verbosity: KittyImageVerbosity,
+        /// Whether enough of the envelope was trusted to emit a wire error.
+        respond: bool,
+        error: String,
+    },
     /// a='t'
     TransmitData {
         transmit: KittyImageTransmit,
@@ -1031,7 +1074,10 @@ pub enum KittyImage {
         verbosity: KittyImageVerbosity,
     },
     /// a='q'
-    Query { transmit: KittyImageTransmit },
+    Query {
+        transmit: KittyImageTransmit,
+        verbosity: KittyImageVerbosity,
+    },
     /// a='f'
     TransmitFrame {
         transmit: KittyImageTransmit,
@@ -1048,8 +1094,9 @@ pub enum KittyImage {
 impl KittyImage {
     pub fn verbosity(&self) -> KittyImageVerbosity {
         match self {
+            Self::Invalid { verbosity, .. } => *verbosity,
             Self::TransmitData { verbosity, .. } => *verbosity,
-            Self::Query { .. } => KittyImageVerbosity::Verbose,
+            Self::Query { verbosity, .. } => *verbosity,
             Self::TransmitDataAndDisplay { verbosity, .. } => *verbosity,
             Self::Display { verbosity, .. } => *verbosity,
             Self::Delete { verbosity, .. } => *verbosity,
@@ -1064,56 +1111,196 @@ impl KittyImage {
         }
         let mut keys_payload_iter = data[1..].splitn(2, |&d| d == b';');
         let keys = keys_payload_iter.next()?;
-        let key_string = core::str::from_utf8(keys).ok()?;
+        let key_string = match core::str::from_utf8(keys) {
+            Ok(value) => value,
+            Err(err) => {
+                return Some(Self::Invalid {
+                    image_id: None,
+                    image_number: None,
+                    placement_id: None,
+                    verbosity: KittyImageVerbosity::Verbose,
+                    respond: false,
+                    error: format!("invalid UTF-8 in control data: {err}"),
+                });
+            }
+        };
         let mut keys: BTreeMap<&str, &str> = BTreeMap::new();
-        for k_v in key_string.split(',') {
-            let mut k_v = k_v.splitn(2, '=');
-            let k = k_v.next()?;
-            let v = k_v.next()?;
-            keys.insert(k, v);
+        if !key_string.is_empty() {
+            for k_v in key_string.split(',') {
+                let mut k_v = k_v.splitn(2, '=');
+                let k = k_v.next().unwrap_or_default();
+                let Some(v) = k_v.next() else {
+                    return Some(Self::Invalid {
+                        image_id: None,
+                        image_number: None,
+                        placement_id: None,
+                        verbosity: KittyImageVerbosity::Verbose,
+                        respond: false,
+                        error: format!("malformed key/value pair: {k}"),
+                    });
+                };
+                keys.insert(k, v);
+            }
         }
 
         let payload = keys_payload_iter.next().unwrap_or(b"");
         let action = get(&keys, "a").unwrap_or("t");
-        let verbosity = KittyImageVerbosity::from_keys(&keys)?;
+        let invalid = |error: String, verbosity: KittyImageVerbosity| Self::Invalid {
+            image_id: geti(&keys, "i"),
+            image_number: geti(&keys, "I"),
+            placement_id: geti(&keys, "p"),
+            verbosity,
+            respond: true,
+            error,
+        };
+        let verbosity = match KittyImageVerbosity::from_keys(&keys) {
+            Some(value) => value,
+            None => {
+                return Some(Self::Invalid {
+                    image_id: geti(&keys, "i"),
+                    image_number: geti(&keys, "I"),
+                    placement_id: geti(&keys, "p"),
+                    verbosity: KittyImageVerbosity::Quiet,
+                    respond: false,
+                    error: "q must be 0, 1, or 2".to_string(),
+                });
+            }
+        };
+
+        for key in [
+            "s", "v", "i", "I", "m", "x", "y", "w", "h", "X", "Y", "c", "r", "C", "p", "U",
+        ] {
+            if let Some(value) = get(&keys, key) {
+                if value.parse::<u32>().is_err() {
+                    if matches!(key, "i" | "I" | "p") {
+                        return Some(Self::Invalid {
+                            image_id: None,
+                            image_number: None,
+                            placement_id: None,
+                            verbosity: KittyImageVerbosity::Quiet,
+                            respond: false,
+                            error: format!("{key} is not a valid unsigned integer: {value}"),
+                        });
+                    }
+                    return Some(invalid(
+                        format!("{key} is not a valid unsigned integer: {value}"),
+                        verbosity,
+                    ));
+                }
+            }
+        }
+        if let Some(value) = get(&keys, "z") {
+            if value.parse::<i32>().is_err() {
+                return Some(invalid(
+                    format!("z is not a valid integer: {value}"),
+                    verbosity,
+                ));
+            }
+        }
+        if let Some(value) = get(&keys, "U") {
+            if value != "0" && value != "1" {
+                return Some(invalid(format!("U must be 0 or 1, got {value}"), verbosity));
+            }
+        }
+        if geti::<u32>(&keys, "i").is_some() && geti::<u32>(&keys, "I").is_some() {
+            return Some(invalid(
+                "i and I are mutually exclusive".to_string(),
+                verbosity,
+            ));
+        }
         match action {
             "t" => Some(Self::TransmitData {
-                transmit: KittyImageTransmit::from_keys(&keys, payload)?,
+                transmit: match KittyImageTransmit::from_keys(&keys, payload) {
+                    Some(value) => value,
+                    None => {
+                        return Some(invalid(
+                            "invalid transmit parameters".to_string(),
+                            verbosity,
+                        ));
+                    }
+                },
                 verbosity,
             }),
             "q" => Some(Self::Query {
-                transmit: KittyImageTransmit::from_keys(&keys, payload)?,
+                transmit: match KittyImageTransmit::from_keys(&keys, payload) {
+                    Some(value) => value,
+                    None => {
+                        return Some(invalid("invalid query parameters".to_string(), verbosity));
+                    }
+                },
+                verbosity,
             }),
             "T" => Some(Self::TransmitDataAndDisplay {
-                transmit: KittyImageTransmit::from_keys(&keys, payload)?,
-                placement: KittyImagePlacement::from_keys(&keys)?,
+                transmit: match KittyImageTransmit::from_keys(&keys, payload) {
+                    Some(value) => value,
+                    None => {
+                        return Some(invalid(
+                            "invalid transmit parameters".to_string(),
+                            verbosity,
+                        ));
+                    }
+                },
+                placement: match KittyImagePlacement::from_keys(&keys) {
+                    Ok(value) => value,
+                    Err(err) => return Some(invalid(err, verbosity)),
+                },
                 verbosity,
             }),
             "p" => Some(Self::Display {
-                placement: KittyImagePlacement::from_keys(&keys)?,
+                placement: match KittyImagePlacement::from_keys(&keys) {
+                    Ok(value) => value,
+                    Err(err) => return Some(invalid(err, verbosity)),
+                },
                 image_id: geti(&keys, "i"),
                 image_number: geti(&keys, "I"),
                 verbosity,
             }),
             "d" => Some(Self::Delete {
-                what: KittyImageDelete::from_keys(&keys)?,
+                what: match KittyImageDelete::from_keys(&keys) {
+                    Some(value) => value,
+                    None => {
+                        return Some(invalid("invalid delete parameters".to_string(), verbosity));
+                    }
+                },
                 verbosity,
             }),
             "f" => Some(Self::TransmitFrame {
-                transmit: KittyImageTransmit::from_keys(&keys, payload)?,
-                frame: KittyImageFrame::from_keys(&keys)?,
+                transmit: match KittyImageTransmit::from_keys(&keys, payload) {
+                    Some(value) => value,
+                    None => {
+                        return Some(invalid(
+                            "invalid frame transmit parameters".to_string(),
+                            verbosity,
+                        ));
+                    }
+                },
+                frame: match KittyImageFrame::from_keys(&keys) {
+                    Some(value) => value,
+                    None => {
+                        return Some(invalid("invalid frame parameters".to_string(), verbosity));
+                    }
+                },
                 verbosity,
             }),
             "c" => Some(Self::ComposeFrame {
-                frame: KittyImageFrameCompose::from_keys(&keys)?,
+                frame: match KittyImageFrameCompose::from_keys(&keys) {
+                    Some(value) => value,
+                    None => {
+                        return Some(invalid("invalid compose parameters".to_string(), verbosity));
+                    }
+                },
                 verbosity,
             }),
-            _ => None,
+            _ => Some(invalid(
+                format!("unsupported Kitty action: {action}"),
+                verbosity,
+            )),
         }
     }
 
     fn to_keys(&self, keys: &mut BTreeMap<&'static str, String>) {
         match self {
+            Self::Invalid { .. } => {}
             Self::TransmitData {
                 transmit,
                 verbosity,
@@ -1122,16 +1309,20 @@ impl KittyImage {
                 verbosity.to_keys(keys);
                 transmit.to_keys(keys);
             }
-            Self::Query { transmit } => {
+            Self::Query {
+                transmit,
+                verbosity,
+            } => {
                 keys.insert("a", "q".to_string());
                 transmit.to_keys(keys);
+                verbosity.to_keys(keys);
             }
             Self::TransmitDataAndDisplay {
                 transmit,
                 verbosity,
                 placement,
             } => {
-                keys.insert("a", "Q".to_string());
+                keys.insert("a", "T".to_string());
                 verbosity.to_keys(keys);
                 placement.to_keys(keys);
                 transmit.to_keys(keys);
@@ -1263,6 +1454,58 @@ mod test {
                     background_pixel: None,
                     duration_ms: None,
                 },
+            }
+        );
+    }
+
+    #[test]
+    fn kitty_unicode_placeholder_validation_and_round_trip() {
+        for (input, expected) in [
+            ("Ga=p,i=1", false),
+            ("Ga=p,i=1,U=0", false),
+            ("Ga=p,i=1,U=1", true),
+        ] {
+            let parsed = KittyImage::parse_apc(input.as_bytes()).unwrap();
+            let KittyImage::Display { placement, .. } = parsed else {
+                panic!("expected display action for {input}");
+            };
+            assert_eq!(placement.unicode_placeholder, expected);
+            if expected {
+                assert!(
+                    KittyImage::Display {
+                        image_id: Some(1),
+                        image_number: None,
+                        placement,
+                        verbosity: KittyImageVerbosity::Verbose,
+                    }
+                    .to_string()
+                    .contains("U=1")
+                );
+            }
+        }
+
+        for input in ["Ga=p,i=1,U=2", "Ga=p,i=1,U=no", "Ga=p,i=1,U=4294967296"] {
+            assert!(matches!(
+                KittyImage::parse_apc(input.as_bytes()),
+                Some(KittyImage::Invalid { .. })
+            ));
+        }
+
+        let command = KittyImage::parse_apc("Ga=T,i=9,U=1;AAAA".as_bytes()).unwrap();
+        assert!(command.to_string().contains("a=T"));
+    }
+
+    #[test]
+    fn kitty_delete_image_id_range() {
+        assert_eq!(
+            KittyImage::parse_apc("Ga=d,d=R,x=10,y=20".as_bytes()).unwrap(),
+            KittyImage::Delete {
+                what: KittyImageDelete::ByImageIdRange {
+                    first_image_id: 10,
+                    last_image_id: 20,
+                    delete: true,
+                },
+                verbosity: KittyImageVerbosity::Verbose,
             }
         );
     }
