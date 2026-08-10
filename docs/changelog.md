@@ -75,6 +75,10 @@ As features stabilize some brief notes about them will accumulate here.
   easier to spot the remaining candidates. Thanks to @mr-felixoid and @bew! #7752
 
 #### New
+* Kitty graphics Unicode placeholders are now supported. Applications such as
+  Neovim and tmux can place images using `U=1` virtual placements and render
+  them through text-cell placeholders while preserving scrolling, reflow,
+  redraw, background color and cursor behavior.
 * [wezterm.serde](config/lua/wezterm.serde/index.md) module for serialization
   and deserialization of JSON, TOML and YAML. Thanks to @expnn! #4969
 * `wezterm ssh` now supports agent forwarding. Thanks to @Riatre! #5345
