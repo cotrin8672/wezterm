@@ -1,5 +1,10 @@
 # Kitty Unicode Placeholder Manual Test
 
+The image below must be visible directly under this title as soon as the test
+opens. If only the Markdown alt text is visible, the test has failed.
+
+![WezTerm status line](../docs/screenshots/wezterm-status-powerline.png)
+
 This document exercises the Kitty graphics protocol Unicode placeholder path
 inside Neovim. It must be opened with:
 
@@ -9,6 +14,9 @@ mise run test-kitty-unicode-placeholder
 
 The launcher forces Snacks to treat this WezTerm build as supporting Unicode
 placeholders and enables inline document images only for that Neovim process.
+It also requires ImageMagick's `magick.exe`, which Snacks uses to inspect the
+PNG dimensions. Install it with `scoop install imagemagick` if the launcher
+reports that it is missing.
 
 To validate the launcher and Snacks environment without opening the UI, run:
 
@@ -34,10 +42,9 @@ supported = true
 
 ## Image A: scrolling and redraw
 
-The screenshot below must appear inline at this location. The underlying
-`U+10EEEE` cells and diacritics must not appear as text or tofu glyphs.
-
-![WezTerm status line](../docs/screenshots/wezterm-status-powerline.png)
+Use the screenshot directly below the document title for this test. Its
+underlying `U+10EEEE` cells and diacritics must not appear as text or tofu
+glyphs.
 
 Move this image through the viewport with `Ctrl-E` and `Ctrl-Y`, then execute
 `:redraw!`. The image must remain aligned with this paragraph and must not
