@@ -25,7 +25,7 @@ impl VecStorage {
         if !clear_image_placement {
             if let Some(images) = self.cells[idx].attrs().images() {
                 for image in images {
-                    if image.has_placement_id() {
+                    if image.should_preserve_on_cell_update() {
                         cell.attrs_mut().attach_image(Box::new(image));
                     }
                 }

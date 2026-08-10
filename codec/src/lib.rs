@@ -961,6 +961,8 @@ pub struct SerializedImageCell {
     pub padding_bottom: u16,
     pub image_id: Option<u32>,
     pub placement_id: Option<u32>,
+    #[serde(default)]
+    pub attachment_kind: wezterm_term::image::ImageCellAttachmentKind,
 }
 
 /// What's all this?
@@ -1077,6 +1079,7 @@ impl From<Vec<(StableRowIndex, Line)>> for SerializedLines {
                             padding_bottom,
                             image_id: imcell.image_id(),
                             placement_id: imcell.placement_id(),
+                            attachment_kind: imcell.attachment_kind(),
                             data_hash: imcell.image_data().hash(),
                         });
                     }
@@ -1261,5 +1264,27 @@ mod test {
             },
             Pdu::decode(encoded.as_slice()).unwrap()
         );
+    }
+
+    #[test]
+    fn image_cell_attachment_kind_round_trips() {
+        let image = SerializedImageCell {
+            line_idx: 3,
+            cell_idx: 4,
+            top_left: TextureCoordinate::new_f32(0.0, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            data_hash: [7; 32],
+            z_index: -1,
+            padding_left: 0,
+            padding_top: 1,
+            padding_right: 2,
+            padding_bottom: 3,
+            image_id: Some(42),
+            placement_id: Some(9),
+            attachment_kind: wezterm_term::image::ImageCellAttachmentKind::KittyUnicodePlaceholder,
+        };
+        let (encoded, compressed) = serialize(&image).unwrap();
+        let decoded: SerializedImageCell = deserialize(encoded.as_slice(), compressed).unwrap();
+        assert_eq!(decoded, image);
     }
 }

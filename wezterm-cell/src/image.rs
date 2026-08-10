@@ -59,6 +59,14 @@ pub struct TextureCoordinate {
     pub y: NotNan<f32>,
 }
 
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImageCellAttachmentKind {
+    #[default]
+    Normal,
+    KittyUnicodePlaceholder,
+}
+
 impl TextureCoordinate {
     pub fn new(x: NotNan<f32>, y: NotNan<f32>) -> Self {
         Self { x, y }
@@ -97,6 +105,8 @@ pub struct ImageCell {
 
     image_id: Option<u32>,
     placement_id: Option<u32>,
+    #[cfg_attr(feature = "use_serde", serde(default))]
+    attachment_kind: ImageCellAttachmentKind,
 }
 
 impl ImageCell {
@@ -119,6 +129,7 @@ impl ImageCell {
         self.padding_bottom.hash(hasher);
         self.image_id.hash(hasher);
         self.placement_id.hash(hasher);
+        self.attachment_kind.hash(hasher);
     }
 
     pub fn with_z_index(
@@ -133,6 +144,34 @@ impl ImageCell {
         image_id: Option<u32>,
         placement_id: Option<u32>,
     ) -> Self {
+        Self::with_attachment_kind(
+            top_left,
+            bottom_right,
+            data,
+            z_index,
+            padding_left,
+            padding_top,
+            padding_right,
+            padding_bottom,
+            image_id,
+            placement_id,
+            ImageCellAttachmentKind::Normal,
+        )
+    }
+
+    pub fn with_attachment_kind(
+        top_left: TextureCoordinate,
+        bottom_right: TextureCoordinate,
+        data: Arc<ImageData>,
+        z_index: i32,
+        padding_left: u16,
+        padding_top: u16,
+        padding_right: u16,
+        padding_bottom: u16,
+        image_id: Option<u32>,
+        placement_id: Option<u32>,
+        attachment_kind: ImageCellAttachmentKind,
+    ) -> Self {
         Self {
             top_left,
             bottom_right,
@@ -144,6 +183,7 @@ impl ImageCell {
             padding_bottom,
             image_id,
             placement_id,
+            attachment_kind,
         }
     }
 
@@ -153,6 +193,14 @@ impl ImageCell {
 
     pub fn has_placement_id(&self) -> bool {
         self.placement_id.is_some()
+    }
+
+    pub fn attachment_kind(&self) -> ImageCellAttachmentKind {
+        self.attachment_kind
+    }
+
+    pub fn should_preserve_on_cell_update(&self) -> bool {
+        self.attachment_kind == ImageCellAttachmentKind::Normal && self.has_placement_id()
     }
 
     pub fn image_id(&self) -> Option<u32> {
@@ -191,6 +239,36 @@ impl ImageCell {
             self.padding_right,
             self.padding_bottom,
         )
+    }
+}
+
+#[cfg(test)]
+mod image_cell_attachment_test {
+    use super::*;
+
+    fn image(kind: ImageCellAttachmentKind) -> ImageCell {
+        ImageCell::with_attachment_kind(
+            TextureCoordinate::new_f32(0.0, 0.0),
+            TextureCoordinate::new_f32(1.0, 1.0),
+            Arc::new(ImageData::with_data(ImageDataType::placeholder())),
+            -1,
+            0,
+            0,
+            0,
+            0,
+            Some(1),
+            Some(2),
+            kind,
+        )
+    }
+
+    #[test]
+    fn only_normal_protocol_placements_survive_cell_updates() {
+        assert!(image(ImageCellAttachmentKind::Normal).should_preserve_on_cell_update());
+        assert!(
+            !image(ImageCellAttachmentKind::KittyUnicodePlaceholder)
+                .should_preserve_on_cell_update()
+        );
     }
 }
 

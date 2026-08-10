@@ -387,6 +387,13 @@ impl CellAttributes {
         self.deallocate_fat_attributes_if_none();
     }
 
+    pub fn detach_images_by_kind(&mut self, kind: image::ImageCellAttachmentKind) {
+        if let Some(fat) = self.fat.as_mut() {
+            fat.image.retain(|im| im.attachment_kind() != kind);
+        }
+        self.deallocate_fat_attributes_if_none();
+    }
+
     /// Add an image attachement, preserving any existing attachments.
     /// The list of images is maintained in z-index order
     pub fn attach_image(&mut self, image: Box<ImageCell>) -> &mut Self {

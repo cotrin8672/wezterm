@@ -699,7 +699,7 @@ pub(crate) async fn hydrate_lines(
             if let Some(line) = line_by_idx.get_mut(&im.line_idx) {
                 if let Some(cell) = line.cells_mut_for_attr_changes_only().get_mut(im.cell_idx) {
                     cell.attrs_mut()
-                        .attach_image(Box::new(ImageCell::with_z_index(
+                        .attach_image(Box::new(ImageCell::with_attachment_kind(
                             im.top_left,
                             im.bottom_right,
                             Arc::clone(data),
@@ -710,6 +710,7 @@ pub(crate) async fn hydrate_lines(
                             im.padding_bottom,
                             im.image_id,
                             im.placement_id,
+                            im.attachment_kind,
                         )));
                 }
             }
