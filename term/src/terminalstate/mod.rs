@@ -450,6 +450,28 @@ struct ThreadedWriter {
 enum WriterMessage {
     Data(Vec<u8>),
     Flush,
+    FlushAndWait(Sender<Result<(), WriterFailure>>),
+}
+
+#[derive(Debug, Clone)]
+struct WriterFailure {
+    kind: std::io::ErrorKind,
+    message: String,
+}
+
+impl From<std::io::Error> for WriterFailure {
+    fn from(err: std::io::Error) -> Self {
+        Self {
+            kind: err.kind(),
+            message: err.to_string(),
+        }
+    }
+}
+
+impl WriterFailure {
+    fn into_io_error(self) -> std::io::Error {
+        std::io::Error::new(self.kind, self.message)
+    }
 }
 
 impl ThreadedWriter {
@@ -457,15 +479,31 @@ impl ThreadedWriter {
         let (sender, receiver) = channel::<WriterMessage>();
 
         std::thread::spawn(move || {
+            let mut failure: Option<WriterFailure> = None;
             while let Ok(msg) = receiver.recv() {
                 match msg {
                     WriterMessage::Data(buf) => {
-                        if writer.write(&buf).is_err() {
-                            break;
+                        if failure.is_none() {
+                            if let Err(err) = writer.write_all(&buf) {
+                                failure = Some(err.into());
+                            }
                         }
                     }
                     WriterMessage::Flush => {
-                        if writer.flush().is_err() {
+                        if failure.is_none() {
+                            if let Err(err) = writer.flush() {
+                                failure = Some(err.into());
+                            }
+                        }
+                    }
+                    WriterMessage::FlushAndWait(ack) => {
+                        if failure.is_none() {
+                            if let Err(err) = writer.flush() {
+                                failure = Some(err.into());
+                            }
+                        }
+                        let result = failure.clone().map_or(Ok(()), Err);
+                        if ack.send(result).is_err() {
                             break;
                         }
                     }
@@ -474,6 +512,17 @@ impl ThreadedWriter {
         });
 
         Self { sender }
+    }
+
+    fn flush_and_wait(&mut self) -> std::io::Result<()> {
+        let (ack_sender, ack_receiver) = channel();
+        self.sender
+            .send(WriterMessage::FlushAndWait(ack_sender))
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?;
+        ack_receiver
+            .recv()
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?
+            .map_err(WriterFailure::into_io_error)
     }
 }
 
@@ -910,6 +959,9 @@ impl TerminalState {
                 saved.position.seqno = self.seqno;
                 saved.wrap_next = false;
             }
+        }
+        if self.has_kitty_virtual_placements() {
+            self.refresh_kitty_unicode_placeholders();
         }
     }
 
@@ -2762,5 +2814,34 @@ impl TerminalState {
             .last()
             .copied()
             .unwrap_or(self.keyboard_encoding)
+    }
+}
+
+#[cfg(test)]
+mod threaded_writer_test {
+    use super::*;
+
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected write failure",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn synchronous_flush_reports_background_write_failure() {
+        let mut writer = ThreadedWriter::new(Box::new(FailingWriter));
+        writer.write_all(b"response").unwrap();
+        let err = writer.flush_and_wait().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(err.to_string().contains("injected write failure"));
     }
 }

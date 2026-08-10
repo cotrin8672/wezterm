@@ -130,9 +130,11 @@ impl<'a> Performer<'a> {
         } else {
             p.as_str()
         };
+        let mut saw_kitty_unicode_placeholder = false;
 
         for g in Graphemes::new(text) {
             let g = self.remap_grapheme(g);
+            saw_kitty_unicode_placeholder |= g.starts_with('\u{10eeee}');
 
             let mut print_width = grapheme_column_width(g, Some(&self.unicode_version));
             if print_width == 0 {
@@ -231,6 +233,10 @@ impl<'a> Performer<'a> {
             }
         }
 
+        if saw_kitty_unicode_placeholder || self.has_kitty_virtual_placements() {
+            self.refresh_kitty_unicode_placeholders();
+        }
+
         std::mem::swap(&mut self.print, &mut p);
         self.print.clear();
     }
@@ -275,7 +281,12 @@ impl<'a> Performer<'a> {
             Action::DeviceControl(ctrl) => self.device_control(ctrl),
             Action::OperatingSystemCommand(osc) => self.osc_dispatch(*osc),
             Action::Esc(esc) => self.esc_dispatch(esc),
-            Action::CSI(csi) => self.csi_dispatch(csi),
+            Action::CSI(csi) => {
+                self.csi_dispatch(csi);
+                if self.has_kitty_virtual_placements() {
+                    self.refresh_kitty_unicode_placeholders();
+                }
+            }
             Action::Sixel(sixel) => self.sixel(sixel),
             Action::XtGetTcap(names) => self.xt_get_tcap(names),
             Action::KittyImage(img) => {

@@ -6,10 +6,12 @@ use ::image::{
 };
 use anyhow::Context;
 use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
-use wezterm_cell::image::ImageDataType;
+use wezterm_cell::color::ColorAttribute;
+use wezterm_cell::image::{ImageCell, ImageCellAttachmentKind, ImageDataType, TextureCoordinate};
 use wezterm_escape_parser::apc::{
     KittyFrameCompositionMode, KittyImage, KittyImageCompression, KittyImageData, KittyImageDelete,
     KittyImageFormat, KittyImageFrame, KittyImageFrameCompose, KittyImagePlacement,
@@ -24,8 +26,95 @@ pub struct KittyImageState {
     number_to_id: HashMap<u32, u32>,
     id_to_data: HashMap<u32, Arc<ImageData>>,
     placements: HashMap<(u32, Option<u32>), PlacementInfo>,
+    virtual_placements: Vec<KittyVirtualPlacement>,
+    next_virtual_placement_order: u64,
     used_memory: usize,
 }
+
+#[derive(Debug, Clone)]
+struct KittyVirtualPlacement {
+    image_id: u32,
+    placement_id: Option<u32>,
+    columns: u32,
+    rows: u32,
+    image_width: u32,
+    image_height: u32,
+    data: Arc<ImageData>,
+    order: u64,
+}
+
+const KITTY_UNICODE_PLACEHOLDER: char = '\u{10eeee}';
+
+#[derive(Debug)]
+struct KittyProtocolError {
+    code: &'static str,
+    printable_detail: String,
+}
+
+impl KittyProtocolError {
+    fn new(code: &'static str, detail: impl std::fmt::Display) -> Self {
+        Self {
+            code,
+            printable_detail: detail
+                .to_string()
+                .chars()
+                .map(|ch| {
+                    if ch.is_ascii_graphic() || ch == ' ' {
+                        ch
+                    } else {
+                        '?'
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn invalid(detail: impl std::fmt::Display) -> Self {
+        Self::new("EINVAL", detail)
+    }
+
+    fn not_found(detail: impl std::fmt::Display) -> Self {
+        Self::new("ENOENT", detail)
+    }
+}
+
+impl std::fmt::Display for KittyProtocolError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}:{}", self.code, self.printable_detail)
+    }
+}
+
+impl std::error::Error for KittyProtocolError {}
+
+// The fixed table published by the Kitty graphics protocol.  Keep this table
+// ordered: its zero-based index is the encoded row/column/high-byte value.
+const KITTY_ROW_COLUMN_DIACRITICS: &[u32] = &[
+    0x0305, 0x030D, 0x030E, 0x0310, 0x0312, 0x033D, 0x033E, 0x033F, 0x0346, 0x034A, 0x034B, 0x034C,
+    0x0350, 0x0351, 0x0352, 0x0357, 0x035B, 0x0363, 0x0364, 0x0365, 0x0366, 0x0367, 0x0368, 0x0369,
+    0x036A, 0x036B, 0x036C, 0x036D, 0x036E, 0x036F, 0x0483, 0x0484, 0x0485, 0x0486, 0x0487, 0x0592,
+    0x0593, 0x0594, 0x0595, 0x0597, 0x0598, 0x0599, 0x059C, 0x059D, 0x059E, 0x059F, 0x05A0, 0x05A1,
+    0x05A8, 0x05A9, 0x05AB, 0x05AC, 0x05AF, 0x05C4, 0x0610, 0x0611, 0x0612, 0x0613, 0x0614, 0x0615,
+    0x0616, 0x0617, 0x0657, 0x0658, 0x0659, 0x065A, 0x065B, 0x065D, 0x065E, 0x06D6, 0x06D7, 0x06D8,
+    0x06D9, 0x06DA, 0x06DB, 0x06DC, 0x06DF, 0x06E0, 0x06E1, 0x06E2, 0x06E4, 0x06E7, 0x06E8, 0x06EB,
+    0x06EC, 0x0730, 0x0732, 0x0733, 0x0735, 0x0736, 0x073A, 0x073D, 0x073F, 0x0740, 0x0741, 0x0743,
+    0x0745, 0x0747, 0x0749, 0x074A, 0x07EB, 0x07EC, 0x07ED, 0x07EE, 0x07EF, 0x07F0, 0x07F1, 0x07F3,
+    0x0816, 0x0817, 0x0818, 0x0819, 0x081B, 0x081C, 0x081D, 0x081E, 0x081F, 0x0820, 0x0821, 0x0822,
+    0x0823, 0x0825, 0x0826, 0x0827, 0x0829, 0x082A, 0x082B, 0x082C, 0x082D, 0x0951, 0x0953, 0x0954,
+    0x0F82, 0x0F83, 0x0F86, 0x0F87, 0x135D, 0x135E, 0x135F, 0x17DD, 0x193A, 0x1A17, 0x1A75, 0x1A76,
+    0x1A77, 0x1A78, 0x1A79, 0x1A7A, 0x1A7B, 0x1A7C, 0x1B6B, 0x1B6D, 0x1B6E, 0x1B6F, 0x1B70, 0x1B71,
+    0x1B72, 0x1B73, 0x1CD0, 0x1CD1, 0x1CD2, 0x1CDA, 0x1CDB, 0x1CE0, 0x1DC0, 0x1DC1, 0x1DC3, 0x1DC4,
+    0x1DC5, 0x1DC6, 0x1DC7, 0x1DC8, 0x1DC9, 0x1DCB, 0x1DCC, 0x1DD1, 0x1DD2, 0x1DD3, 0x1DD4, 0x1DD5,
+    0x1DD6, 0x1DD7, 0x1DD8, 0x1DD9, 0x1DDA, 0x1DDB, 0x1DDC, 0x1DDD, 0x1DDE, 0x1DDF, 0x1DE0, 0x1DE1,
+    0x1DE2, 0x1DE3, 0x1DE4, 0x1DE5, 0x1DE6, 0x1DFE, 0x20D0, 0x20D1, 0x20D4, 0x20D5, 0x20D6, 0x20D7,
+    0x20DB, 0x20DC, 0x20E1, 0x20E7, 0x20E9, 0x20F0, 0x2CEF, 0x2CF0, 0x2CF1, 0x2DE0, 0x2DE1, 0x2DE2,
+    0x2DE3, 0x2DE4, 0x2DE5, 0x2DE6, 0x2DE7, 0x2DE8, 0x2DE9, 0x2DEA, 0x2DEB, 0x2DEC, 0x2DED, 0x2DEE,
+    0x2DEF, 0x2DF0, 0x2DF1, 0x2DF2, 0x2DF3, 0x2DF4, 0x2DF5, 0x2DF6, 0x2DF7, 0x2DF8, 0x2DF9, 0x2DFA,
+    0x2DFB, 0x2DFC, 0x2DFD, 0x2DFE, 0x2DFF, 0xA66F, 0xA67C, 0xA67D, 0xA6F0, 0xA6F1, 0xA8E0, 0xA8E1,
+    0xA8E2, 0xA8E3, 0xA8E4, 0xA8E5, 0xA8E6, 0xA8E7, 0xA8E8, 0xA8E9, 0xA8EA, 0xA8EB, 0xA8EC, 0xA8ED,
+    0xA8EE, 0xA8EF, 0xA8F0, 0xA8F1, 0xAAB0, 0xAAB2, 0xAAB3, 0xAAB7, 0xAAB8, 0xAABE, 0xAABF, 0xAAC1,
+    0xFE20, 0xFE21, 0xFE22, 0xFE23, 0xFE24, 0xFE25, 0xFE26, 0x10A0F, 0x10A38, 0x1D185, 0x1D186,
+    0x1D187, 0x1D188, 0x1D189, 0x1D1AA, 0x1D1AB, 0x1D1AC, 0x1D1AD, 0x1D242, 0x1D243, 0x1D244,
+];
 
 impl KittyImageState {
     fn remove_data_for_id(&mut self, image_id: u32) {
@@ -46,7 +135,12 @@ impl KittyImageState {
     fn prune_unreferenced(&mut self) {
         let budget = 320 * 1024 * 1024; // FIXME: make this configurable
         if self.used_memory > budget {
-            let referenced: HashSet<u32> = self.placements.keys().map(|(k, _)| *k).collect();
+            let referenced: HashSet<u32> = self
+                .placements
+                .keys()
+                .map(|(k, _)| *k)
+                .chain(self.virtual_placements.iter().map(|p| p.image_id))
+                .collect();
             let target = self.used_memory - budget;
             let mut freed = 0;
             self.id_to_data.retain(|id, data| {
@@ -68,7 +162,227 @@ impl KittyImageState {
     }
 }
 
+fn kitty_diacritic_index(ch: char) -> Option<u32> {
+    KITTY_ROW_COLUMN_DIACRITICS
+        .iter()
+        .position(|candidate| *candidate == ch as u32)
+        .map(|idx| idx as u32)
+}
+
+fn kitty_color_id(color: ColorAttribute) -> u32 {
+    match color {
+        ColorAttribute::PaletteIndex(idx) => idx as u32,
+        ColorAttribute::TrueColorWithPaletteFallback(rgb, _)
+        | ColorAttribute::TrueColorWithDefaultFallback(rgb) => {
+            let (r, g, b, _) = rgb.as_rgba_u8();
+            u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)
+        }
+        ColorAttribute::Default => 0,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PlaceholderRunCell {
+    row: u32,
+    column: u32,
+    high: u32,
+    foreground: ColorAttribute,
+    underline: ColorAttribute,
+}
+
+fn decode_kitty_placeholder_cell(
+    text: &str,
+    foreground: ColorAttribute,
+    underline: ColorAttribute,
+    previous: Option<PlaceholderRunCell>,
+) -> Option<PlaceholderRunCell> {
+    let mut chars = text.chars();
+    if chars.next() != Some(KITTY_UNICODE_PLACEHOLDER) {
+        return None;
+    }
+    let marks: Vec<Option<u32>> = chars.take(3).map(kitty_diacritic_index).collect();
+    let mut row = marks.first().copied().flatten().unwrap_or(0);
+    let mut column = marks.get(1).copied().flatten().unwrap_or(0);
+    let mut high = marks
+        .get(2)
+        .copied()
+        .flatten()
+        .filter(|value| *value <= u8::MAX as u32)
+        .unwrap_or(0);
+
+    if let Some(left) =
+        previous.filter(|left| left.foreground == foreground && left.underline == underline)
+    {
+        match marks.len() {
+            0 => {
+                column = left.column.checked_add(1)?;
+                row = left.row;
+                high = left.high;
+            }
+            1 if marks[0].is_some() && row == left.row => {
+                column = left.column.checked_add(1)?;
+                high = left.high;
+            }
+            2 if marks[0].is_some() && marks[1].is_some() && row == left.row => {
+                if left.column.checked_add(1) == Some(column) {
+                    high = left.high;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(PlaceholderRunCell {
+        row,
+        column,
+        high,
+        foreground,
+        underline,
+    })
+}
+
+fn kitty_placeholder_image_cell(
+    placement: &KittyVirtualPlacement,
+    row: u32,
+    column: u32,
+    cell_width: usize,
+    cell_height: usize,
+) -> Option<ImageCell> {
+    if cell_width == 0
+        || cell_height == 0
+        || placement.image_width == 0
+        || placement.image_height == 0
+    {
+        return None;
+    }
+    let cell_width_u32 = u32::try_from(cell_width).ok()?;
+    let cell_height_u32 = u32::try_from(cell_height).ok()?;
+    let columns = if placement.columns == 0 {
+        placement.image_width.div_ceil(cell_width_u32)
+    } else {
+        placement.columns
+    };
+    let rows = if placement.rows == 0 {
+        placement.image_height.div_ceil(cell_height_u32)
+    } else {
+        placement.rows
+    };
+    if columns == 0 || rows == 0 || column >= columns || row >= rows {
+        return None;
+    }
+
+    let grid_width = f64::from(columns) * cell_width as f64;
+    let grid_height = f64::from(rows) * cell_height as f64;
+    let scale = (grid_width / f64::from(placement.image_width))
+        .min(grid_height / f64::from(placement.image_height));
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let rendered_width = f64::from(placement.image_width) * scale;
+    let rendered_height = f64::from(placement.image_height) * scale;
+    let image_left = (grid_width - rendered_width) / 2.0;
+    let image_top = (grid_height - rendered_height) / 2.0;
+    let cell_left = f64::from(column) * cell_width as f64;
+    let cell_top = f64::from(row) * cell_height as f64;
+    let cell_right = cell_left + cell_width as f64;
+    let cell_bottom = cell_top + cell_height as f64;
+    let left = cell_left.max(image_left);
+    let top = cell_top.max(image_top);
+    let right = cell_right.min(image_left + rendered_width);
+    let bottom = cell_bottom.min(image_top + rendered_height);
+    if left >= right || top >= bottom {
+        return None;
+    }
+
+    let padding = |value: f64, maximum: usize| value.round().clamp(0.0, maximum as f64) as u16;
+    Some(ImageCell::with_attachment_kind(
+        TextureCoordinate::new_f32(
+            ((left - image_left) / rendered_width) as f32,
+            ((top - image_top) / rendered_height) as f32,
+        ),
+        TextureCoordinate::new_f32(
+            ((right - image_left) / rendered_width) as f32,
+            ((bottom - image_top) / rendered_height) as f32,
+        ),
+        Arc::clone(&placement.data),
+        -1,
+        padding(left - cell_left, cell_width),
+        padding(top - cell_top, cell_height),
+        padding(cell_right - right, cell_width),
+        padding(cell_bottom - bottom, cell_height),
+        Some(placement.image_id),
+        placement.placement_id,
+        ImageCellAttachmentKind::KittyUnicodePlaceholder,
+    ))
+}
+
 impl TerminalState {
+    pub(crate) fn has_kitty_virtual_placements(&self) -> bool {
+        !self.kitty_img.virtual_placements.is_empty()
+    }
+
+    pub(crate) fn refresh_kitty_unicode_placeholders(&mut self) {
+        let placements = self.kitty_img.virtual_placements.clone();
+        let columns = self.screen().physical_cols.max(1);
+        let rows = self.screen().physical_rows.max(1);
+        let cell_width = self.pixel_width / columns;
+        let cell_height = self.pixel_height / rows;
+        let seqno = self.seqno;
+
+        self.screen_mut().for_each_phys_line_mut(|_, line| {
+            if !line.has_kitty_unicode_placeholder() {
+                return;
+            }
+
+            let cells = line.cells_mut();
+            for cell in cells.iter_mut() {
+                cell.attrs_mut()
+                    .detach_images_by_kind(ImageCellAttachmentKind::KittyUnicodePlaceholder);
+            }
+
+            let mut previous: Option<PlaceholderRunCell> = None;
+            let mut attachments = Vec::new();
+            for (cell_idx, cell) in cells.iter().enumerate() {
+                let foreground = cell.attrs().foreground();
+                let underline = cell.attrs().underline_color();
+                let Some(run) =
+                    decode_kitty_placeholder_cell(cell.str(), foreground, underline, previous)
+                else {
+                    previous = None;
+                    continue;
+                };
+                previous = Some(run);
+
+                let image_id = kitty_color_id(foreground) | (run.high << 24);
+                let requested_placement = kitty_color_id(underline);
+                let placement = placements
+                    .iter()
+                    .filter(|placement| {
+                        placement.image_id == image_id
+                            && (requested_placement == 0
+                                || placement.placement_id == Some(requested_placement))
+                    })
+                    .max_by_key(|placement| placement.order);
+                if let Some(placement) = placement {
+                    if let Some(image_cell) = kitty_placeholder_image_cell(
+                        placement,
+                        run.row,
+                        run.column,
+                        cell_width,
+                        cell_height,
+                    ) {
+                        attachments.push((cell_idx, image_cell));
+                    }
+                }
+            }
+
+            for (cell_idx, image) in attachments {
+                cells[cell_idx].attrs_mut().attach_image(Box::new(image));
+            }
+            line.update_last_change_seqno(seqno);
+        });
+    }
+
     fn kitty_img_place(
         &mut self,
         image_id: Option<u32>,
@@ -81,15 +395,14 @@ impl TerminalState {
             None => *self
                 .kitty_img
                 .number_to_id
-                .get(
-                    &image_number
-                        .ok_or_else(|| anyhow::anyhow!("no image_id or image_number specified!"))?,
-                )
+                .get(&image_number.ok_or_else(|| {
+                    KittyProtocolError::invalid("no image_id or image_number specified")
+                })?)
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
+                    KittyProtocolError::not_found(format!(
                         "image_number has no matching image id {:?} in number_to_id",
                         image_number
-                    )
+                    ))
                 })?,
         };
 
@@ -100,18 +413,42 @@ impl TerminalState {
             placement,
             verbosity
         );
+        let placement_id = placement.placement_id.filter(|id| *id != 0);
+        let img = Arc::clone(self.kitty_img.id_to_data.get(&image_id).ok_or_else(|| {
+            KittyProtocolError::not_found(format!(
+                "no matching image id {} in id_to_data for image_number {:?}",
+                image_id, image_number
+            ))
+        })?);
+        let (image_width, image_height) = img.data().dimensions()?;
+
+        if placement.unicode_placeholder {
+            if placement_id.is_some() {
+                self.kitty_img.virtual_placements.retain(|candidate| {
+                    candidate.image_id != image_id || candidate.placement_id != placement_id
+                });
+            }
+            let order = self.kitty_img.next_virtual_placement_order;
+            self.kitty_img.next_virtual_placement_order = order.saturating_add(1);
+            self.kitty_img
+                .virtual_placements
+                .push(KittyVirtualPlacement {
+                    image_id,
+                    placement_id,
+                    columns: placement.columns.unwrap_or(0),
+                    rows: placement.rows.unwrap_or(0),
+                    image_width,
+                    image_height,
+                    data: img,
+                    order,
+                });
+            self.refresh_kitty_unicode_placeholders();
+            return Ok(());
+        }
+
         if image_id != 0 {
             self.kitty_remove_placement(image_id, placement.placement_id);
         }
-        let img = Arc::clone(self.kitty_img.id_to_data.get(&image_id).ok_or_else(|| {
-            anyhow::anyhow!(
-                "no matching image id {} in id_to_data for image_number {:?}",
-                image_id,
-                image_number
-            )
-        })?);
-
-        let (image_width, image_height) = img.data().dimensions()?;
 
         let info = self.assign_image_to_cells(ImageAttachParams {
             image_width,
@@ -177,27 +514,68 @@ impl TerminalState {
             return Ok(());
         }
         let verbosity = img.verbosity();
-        match img {
-            KittyImage::Query { transmit, .. } => match transmit.data.load_data() {
-                Ok(_) => {
-                    self.kitty_send_response(
-                        verbosity,
-                        true,
-                        transmit.image_id,
-                        transmit.image_number,
-                        "OK".to_string(),
-                    );
-                }
-                Err(err) => {
-                    self.kitty_send_response(
-                        verbosity,
-                        false,
-                        transmit.image_id,
-                        transmit.image_number,
-                        format!("ERROR:{:#}", err),
-                    );
-                }
-            },
+        let (mut response_image_id, response_image_number, response_placement_id) = match &img {
+            KittyImage::Invalid {
+                image_id,
+                image_number,
+                placement_id,
+                ..
+            } => (*image_id, *image_number, *placement_id),
+            KittyImage::TransmitData { transmit, .. }
+            | KittyImage::TransmitFrame { transmit, .. }
+            | KittyImage::Query { transmit, .. } => {
+                (transmit.image_id, transmit.image_number, None)
+            }
+            KittyImage::TransmitDataAndDisplay {
+                transmit,
+                placement,
+                ..
+            } => (
+                transmit.image_id,
+                transmit.image_number,
+                placement.placement_id,
+            ),
+            KittyImage::Display {
+                image_id,
+                image_number,
+                placement,
+                ..
+            } => (*image_id, *image_number, placement.placement_id),
+            KittyImage::Delete {
+                what:
+                    KittyImageDelete::ByImageId {
+                        image_id,
+                        placement_id,
+                        ..
+                    },
+                ..
+            } => (Some(*image_id), None, *placement_id),
+            KittyImage::Delete {
+                what:
+                    KittyImageDelete::ByImageNumber {
+                        image_number,
+                        placement_id,
+                        ..
+                    },
+                ..
+            } => (None, Some(*image_number), *placement_id),
+            KittyImage::Delete { .. } | KittyImage::ComposeFrame { .. } => (None, None, None),
+        };
+        let mut respond = true;
+        let result: anyhow::Result<()> = match img {
+            KittyImage::Invalid {
+                error,
+                respond: can_respond,
+                ..
+            } => {
+                respond = can_respond;
+                Err(KittyProtocolError::invalid(error).into())
+            }
+            KittyImage::Query { transmit, .. } => transmit
+                .data
+                .load_data()
+                .context("validating query image data")
+                .map(|_| ()),
             KittyImage::TransmitData {
                 transmit,
                 verbosity,
@@ -209,8 +587,10 @@ impl TerminalState {
                 };
                 if more_data_follows {
                     self.kitty_img.accumulator.push(img);
+                    respond = false;
+                    Ok(())
                 } else {
-                    self.kitty_img_inner(img)?;
+                    self.kitty_img_inner(img)
                 }
             }
             KittyImage::TransmitDataAndDisplay {
@@ -226,8 +606,10 @@ impl TerminalState {
                 };
                 if more_data_follows {
                     self.kitty_img.accumulator.push(img);
+                    respond = false;
+                    Ok(())
                 } else {
-                    self.kitty_img_inner(img)?;
+                    self.kitty_img_inner(img)
                 }
             }
             KittyImage::Display {
@@ -235,61 +617,194 @@ impl TerminalState {
                 image_number,
                 placement,
                 verbosity,
-            } => {
-                self.kitty_img_place(image_id, image_number, placement, verbosity)?;
-            }
-            KittyImage::Delete {
-                what:
+            } => self.kitty_img_place(image_id, image_number, placement, verbosity),
+            KittyImage::Delete { what, verbosity: _ } => {
+                // A delete always terminates a partial transfer, even when the
+                // selector does not ultimately match an image.
+                self.kitty_img.accumulator.clear();
+                match what {
                     KittyImageDelete::ByImageId {
                         image_id,
                         placement_id,
                         delete,
+                    } => {
+                        let placement_id = placement_id.filter(|id| *id != 0);
+                        let real_exists = self.kitty_img.placements.keys().any(|(id, pid)| {
+                            *id == image_id && (placement_id.is_none() || *pid == placement_id)
+                        });
+                        let virtual_exists =
+                            self.kitty_img.virtual_placements.iter().any(|candidate| {
+                                candidate.image_id == image_id
+                                    && (placement_id.is_none()
+                                        || candidate.placement_id == placement_id)
+                            });
+                        if (placement_id.is_some() && !real_exists && !virtual_exists)
+                            || (placement_id.is_none()
+                                && !real_exists
+                                && !virtual_exists
+                                && !self.kitty_img.id_to_data.contains_key(&image_id))
+                        {
+                            Err(anyhow::anyhow!(
+                                "ENOENT:no image or placement for id {image_id}"
+                            ))
+                        } else {
+                            self.kitty_remove_placement(image_id, placement_id);
+                            self.kitty_img.virtual_placements.retain(|candidate| {
+                                candidate.image_id != image_id
+                                    || (placement_id.is_some()
+                                        && candidate.placement_id != placement_id)
+                            });
+                            if delete {
+                                self.kitty_img.remove_data_for_id(image_id);
+                            }
+                            self.refresh_kitty_unicode_placeholders();
+                            Ok(())
+                        }
+                    }
+                    KittyImageDelete::ByImageNumber {
+                        image_number,
+                        placement_id,
+                        delete,
+                    } => match self.kitty_img.number_to_id.get(&image_number).copied() {
+                        Some(image_id) => {
+                            let placement_id = placement_id.filter(|id| *id != 0);
+                            if placement_id.is_some()
+                                && !self
+                                    .kitty_img
+                                    .placements
+                                    .keys()
+                                    .any(|(id, pid)| *id == image_id && *pid == placement_id)
+                                && !self.kitty_img.virtual_placements.iter().any(|candidate| {
+                                    candidate.image_id == image_id
+                                        && candidate.placement_id == placement_id
+                                })
+                            {
+                                Err(anyhow::anyhow!("ENOENT:no matching placement"))
+                            } else {
+                                self.kitty_remove_placement(image_id, placement_id);
+                                self.kitty_img.virtual_placements.retain(|candidate| {
+                                    candidate.image_id != image_id
+                                        || (placement_id.is_some()
+                                            && candidate.placement_id != placement_id)
+                                });
+                                if delete {
+                                    self.kitty_img.remove_data_for_id(image_id);
+                                }
+                                self.refresh_kitty_unicode_placeholders();
+                                Ok(())
+                            }
+                        }
+                        None => Err(anyhow::anyhow!(
+                            "ENOENT:no image for image number {image_number}"
+                        )),
                     },
-                verbosity,
-            } => {
-                log::trace!(
-                    "remove a placement: image_id {} placement_id {:?} delete {} verb {:?}",
-                    image_id,
-                    placement_id,
-                    delete,
-                    verbosity
-                );
-
-                self.kitty_remove_placement(image_id, placement_id);
-
-                if delete {
-                    self.kitty_img.remove_data_for_id(image_id);
+                    KittyImageDelete::ByImageIdRange {
+                        first_image_id,
+                        last_image_id,
+                        delete,
+                    } => {
+                        if first_image_id > last_image_id {
+                            Err(anyhow::anyhow!("EINVAL:image id range is reversed"))
+                        } else {
+                            let ids: HashSet<u32> = self
+                                .kitty_img
+                                .id_to_data
+                                .keys()
+                                .chain(self.kitty_img.placements.keys().map(|(id, _)| id))
+                                .chain(
+                                    self.kitty_img
+                                        .virtual_placements
+                                        .iter()
+                                        .map(|p| &p.image_id),
+                                )
+                                .copied()
+                                .filter(|id| *id >= first_image_id && *id <= last_image_id)
+                                .collect();
+                            if ids.is_empty() {
+                                Err(anyhow::anyhow!("ENOENT:no images in requested range"))
+                            } else {
+                                for image_id in ids {
+                                    self.kitty_remove_placement(image_id, None);
+                                    self.kitty_img
+                                        .virtual_placements
+                                        .retain(|p| p.image_id != image_id);
+                                    if delete {
+                                        self.kitty_img.remove_data_for_id(image_id);
+                                    }
+                                }
+                                self.refresh_kitty_unicode_placeholders();
+                                Ok(())
+                            }
+                        }
+                    }
+                    KittyImageDelete::All { delete } => {
+                        self.kitty_remove_all_placements(delete);
+                        Ok(())
+                    }
+                    other => Err(anyhow::anyhow!(
+                        "EINVAL:delete selector is not implemented: {other:?}"
+                    )),
                 }
-            }
-            KittyImage::Delete {
-                what: KittyImageDelete::All { delete },
-                verbosity: _,
-            } => {
-                self.kitty_remove_all_placements(delete);
-            }
-            KittyImage::Delete { what, verbosity } => {
-                log::warn!("unhandled KittyImage::Delete {:?} {:?}", what, verbosity);
             }
             KittyImage::TransmitFrame {
                 transmit,
                 frame,
                 verbosity,
-            } => {
-                if let Err(err) = self.kitty_frame_transmit(transmit, frame, verbosity) {
-                    log::error!("Error {:#} while handling KittyImage::TransmitFrame", err,);
-                }
-            }
+            } => self.kitty_frame_transmit(transmit, frame, verbosity),
             KittyImage::ComposeFrame { frame, verbosity } => {
-                if let Err(err) = self.kitty_frame_compose(frame, verbosity) {
-                    log::error!("Error {:#} while handling KittyImage::ComposeFrame", err);
-                }
-            }
-            KittyImage::Invalid { error, .. } => {
-                anyhow::bail!("invalid Kitty graphics command: {error}");
+                self.kitty_frame_compose(frame, verbosity)
             }
         };
 
-        Ok(())
+        if response_image_id.is_none() {
+            if let Some(image_number) = response_image_number {
+                response_image_id = self.kitty_img.number_to_id.get(&image_number).copied();
+            }
+        }
+        if respond {
+            let (success, message) = match &result {
+                Ok(()) => (true, "OK".to_string()),
+                Err(err) => {
+                    let (code, detail) =
+                        if let Some(protocol) = err.downcast_ref::<KittyProtocolError>() {
+                            (protocol.code, protocol.printable_detail.clone())
+                        } else {
+                            let detail = format!("{err:#}")
+                                .chars()
+                                .map(|ch| {
+                                    if ch.is_ascii_graphic() || ch == ' ' {
+                                        ch
+                                    } else {
+                                        '?'
+                                    }
+                                })
+                                .collect::<String>();
+                            let code = if detail.starts_with("ENOENT:") {
+                                "ENOENT"
+                            } else {
+                                "EINVAL"
+                            };
+                            let detail = detail
+                                .strip_prefix("ENOENT:")
+                                .or_else(|| detail.strip_prefix("EINVAL:"))
+                                .unwrap_or(&detail)
+                                .to_string();
+                            (code, detail)
+                        };
+                    (false, format!("{code}:{detail}"))
+                }
+            };
+            self.kitty_send_response(
+                verbosity,
+                success,
+                response_image_id,
+                response_image_number,
+                response_placement_id,
+                message,
+            )?;
+        }
+
+        result
     }
 
     fn kitty_remove_placement_from_model(
@@ -340,14 +855,41 @@ impl TerminalState {
         );
     }
 
+    fn kitty_retire_image_id(&mut self, image_id: u32) {
+        self.kitty_remove_placement(image_id, None);
+        self.kitty_img
+            .virtual_placements
+            .retain(|placement| placement.image_id != image_id);
+        self.kitty_img.remove_data_for_id(image_id);
+        self.kitty_img
+            .number_to_id
+            .retain(|_, mapped_id| *mapped_id != image_id);
+        self.refresh_kitty_unicode_placeholders();
+    }
+
     pub(crate) fn kitty_remove_all_placements(&mut self, delete: bool) {
         for ((image_id, p), info) in std::mem::take(&mut self.kitty_img.placements).into_iter() {
             self.kitty_remove_placement_from_model(image_id, p, info);
         }
         if delete {
-            self.kitty_img.id_to_data.clear();
-            self.kitty_img.used_memory = 0;
-            self.kitty_img.number_to_id.clear();
+            let virtual_ids: HashSet<u32> = self
+                .kitty_img
+                .virtual_placements
+                .iter()
+                .map(|placement| placement.image_id)
+                .collect();
+            self.kitty_img
+                .id_to_data
+                .retain(|image_id, _| virtual_ids.contains(image_id));
+            self.kitty_img.used_memory = self
+                .kitty_img
+                .id_to_data
+                .values()
+                .map(|data| data.len())
+                .sum();
+            self.kitty_img
+                .number_to_id
+                .retain(|_, image_id| virtual_ids.contains(image_id));
         }
     }
 
@@ -357,90 +899,88 @@ impl TerminalState {
         success: bool,
         image_id: Option<u32>,
         image_no: Option<u32>,
+        placement_id: Option<u32>,
         message: String,
-    ) {
+    ) -> anyhow::Result<()> {
         match verbosity {
             KittyImageVerbosity::Verbose => {}
             KittyImageVerbosity::OnlyErrors => {
                 if success {
-                    return;
+                    return Ok(());
                 }
             }
             KittyImageVerbosity::Quiet => {
-                return;
+                return Ok(());
             }
         }
 
         log::trace!("Query Response: {}", message);
 
+        let placement = placement_id
+            .map(|id| format!(",p={id}"))
+            .unwrap_or_default();
         match (image_id, image_no) {
             (Some(id), Some(no)) => {
-                write!(self.writer, "\x1b_GI={},i={};{}\x1b\\", no, id, message).ok();
+                write!(
+                    self.writer,
+                    "\x1b_GI={},i={}{};{}\x1b\\",
+                    no, id, placement, message
+                )
+                .context("writing Kitty graphics response")?;
             }
             (Some(id), None) => {
-                write!(self.writer, "\x1b_Gi={};{}\x1b\\", id, message).ok();
+                write!(self.writer, "\x1b_Gi={}{};{}\x1b\\", id, placement, message)
+                    .context("writing Kitty graphics response")?;
             }
             (None, Some(no)) => {
-                write!(self.writer, "\x1b_GI={};{}\x1b\\", no, message).ok();
+                write!(self.writer, "\x1b_GI={}{};{}\x1b\\", no, placement, message)
+                    .context("writing Kitty graphics response")?;
             }
             (None, None) => {
-                write!(self.writer, "\x1b_G{}\x1b\\", message).ok();
+                write!(
+                    self.writer,
+                    "\x1b_G{};{}\x1b\\",
+                    placement.trim_start_matches(','),
+                    message
+                )
+                .context("writing Kitty graphics response")?;
             }
         }
-        self.writer.flush().ok();
+        self.writer
+            .flush()
+            .context("flushing Kitty graphics response")?;
+        self.writer
+            .get_mut()
+            .flush_and_wait()
+            .context("waiting for Kitty graphics response writer")?;
+        Ok(())
     }
 
     fn kitty_frame_compose(
         &mut self,
         frame: KittyImageFrameCompose,
-        verbosity: KittyImageVerbosity,
+        _verbosity: KittyImageVerbosity,
     ) -> anyhow::Result<()> {
         let image_id = match frame.image_number {
             Some(no) => match self.kitty_img.number_to_id.get(&no) {
                 Some(id) => *id,
                 None => {
-                    self.kitty_send_response(
-                        verbosity,
-                        false,
-                        frame.image_id,
-                        frame.image_number,
-                        "ENOENT".to_string(),
-                    );
-                    anyhow::bail!("no such image_number {}", no);
+                    anyhow::bail!("ENOENT:no such image_number {}", no);
                 }
             },
-            None => frame.image_id.ok_or_else(|| {
-                self.kitty_send_response(
-                    verbosity,
-                    false,
-                    frame.image_id,
-                    frame.image_number,
-                    "ENOENT".to_string(),
-                );
-                anyhow::anyhow!("no image_id")
-            })?,
+            None => frame
+                .image_id
+                .ok_or_else(|| anyhow::anyhow!("ENOENT:no image_id"))?,
         };
 
-        let src_frame = frame.source_frame.ok_or_else(|| {
-            self.kitty_send_response(
-                verbosity,
-                false,
-                frame.image_id,
-                frame.image_number,
-                "ENOENT".to_string(),
-            );
-            anyhow::anyhow!("missing source frame")
-        })? as usize;
-        let target_frame = frame.target_frame.ok_or_else(|| {
-            self.kitty_send_response(
-                verbosity,
-                false,
-                frame.image_id,
-                frame.image_number,
-                "ENOENT".to_string(),
-            );
-            anyhow::anyhow!("missing target frame")
-        })? as usize;
+        let src_frame = frame
+            .source_frame
+            .ok_or_else(|| anyhow::anyhow!("ENOENT:missing source frame"))?
+            as usize;
+        let target_frame = frame
+            .target_frame
+            .ok_or_else(|| anyhow::anyhow!("ENOENT:missing target frame"))?
+            as usize;
 
         let img = self
             .kitty_img
@@ -544,7 +1084,7 @@ impl TerminalState {
         &mut self,
         mut transmit: KittyImageTransmit,
         frame: KittyImageFrame,
-        verbosity: KittyImageVerbosity,
+        _verbosity: KittyImageVerbosity,
     ) -> anyhow::Result<()> {
         if let Some(no) = transmit.image_number.take() {
             match self.kitty_img.number_to_id.get(&no) {
@@ -581,15 +1121,8 @@ impl TerminalState {
         let anim = match self.kitty_img.id_to_data.get(&image_id) {
             Some(anim) => anim,
             None => {
-                self.kitty_send_response(
-                    verbosity,
-                    false,
-                    Some(image_id),
-                    image_number,
-                    "ENOENT".to_string(),
-                );
                 anyhow::bail!(
-                    "no matching image id {} in id_to_data for image_number {:?}",
+                    "ENOENT:no matching image id {} in id_to_data for image_number {:?}",
                     image_id,
                     image_number
                 )
@@ -759,8 +1292,11 @@ impl TerminalState {
             }
             (Some(id), None) => (id, None),
             (None, Some(no)) => {
-                let id = self.kitty_img.max_image_id + 1;
-                self.kitty_img.number_to_id.insert(no, id);
+                let id = self
+                    .kitty_img
+                    .max_image_id
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("EINVAL:image id space exhausted"))?;
                 (id, Some(no))
             }
         };
@@ -828,8 +1364,11 @@ impl TerminalState {
     fn kitty_img_transmit(
         &mut self,
         transmit: KittyImageTransmit,
-        verbosity: KittyImageVerbosity,
+        _verbosity: KittyImageVerbosity,
     ) -> anyhow::Result<u32> {
+        if let Some(image_id) = transmit.image_id {
+            self.kitty_retire_image_id(image_id);
+        }
         let (image_id, image_number, img) = self.kitty_img_transmit_inner(transmit)?;
         self.kitty_img.max_image_id = self.kitty_img.max_image_id.max(image_id);
 
@@ -837,15 +1376,8 @@ impl TerminalState {
             .raw_image_to_image_data(img)
             .context("storing image data")?;
         self.kitty_img.record_id_to_data(image_id, img);
-
-        if image_number.is_some() {
-            self.kitty_send_response(
-                verbosity,
-                true,
-                Some(image_id),
-                image_number,
-                "OK".to_string(),
-            );
+        if let Some(image_number) = image_number {
+            self.kitty_img.number_to_id.insert(image_number, image_id);
         }
 
         Ok(image_id)
@@ -979,4 +1511,97 @@ where
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod unicode_placeholder_test {
+    use super::*;
+
+    fn mark(index: usize) -> char {
+        char::from_u32(KITTY_ROW_COLUMN_DIACRITICS[index]).unwrap()
+    }
+
+    fn placeholder(indices: &[usize]) -> String {
+        let mut text = KITTY_UNICODE_PLACEHOLDER.to_string();
+        text.extend(indices.iter().map(|index| mark(*index)));
+        text
+    }
+
+    #[test]
+    fn diacritic_bounds_and_inheritance_rules() {
+        assert_eq!(
+            kitty_color_id(ColorAttribute::TrueColorWithDefaultFallback(
+                (42u8, 43u8, 44u8).into(),
+            )),
+            0x2a2b2c
+        );
+        assert_eq!(kitty_diacritic_index(mark(0)), Some(0));
+        assert_eq!(kitty_diacritic_index(mark(255)), Some(255));
+        assert_eq!(kitty_diacritic_index(mark(256)), Some(256));
+        assert_eq!(kitty_diacritic_index(mark(296)), Some(296));
+        assert_eq!(kitty_diacritic_index('\u{0300}'), None);
+
+        let foreground = ColorAttribute::PaletteIndex(7);
+        let underline = ColorAttribute::PaletteIndex(9);
+        let first =
+            decode_kitty_placeholder_cell(&placeholder(&[1, 2, 3]), foreground, underline, None)
+                .unwrap();
+        assert_eq!((first.row, first.column, first.high), (1, 2, 3));
+
+        for text in [placeholder(&[]), placeholder(&[1]), placeholder(&[1, 3])] {
+            let inherited =
+                decode_kitty_placeholder_cell(&text, foreground, underline, Some(first)).unwrap();
+            assert_eq!((inherited.row, inherited.column, inherited.high), (1, 3, 3));
+        }
+
+        let high_out_of_range = decode_kitty_placeholder_cell(
+            &placeholder(&[0, 0, 256, 1]),
+            foreground,
+            underline,
+            None,
+        )
+        .unwrap();
+        assert_eq!(high_out_of_range.high, 0);
+
+        let color_break = decode_kitty_placeholder_cell(
+            &placeholder(&[1]),
+            ColorAttribute::PaletteIndex(8),
+            underline,
+            Some(first),
+        )
+        .unwrap();
+        assert_eq!(
+            (color_break.row, color_break.column, color_break.high),
+            (1, 0, 0)
+        );
+    }
+
+    #[test]
+    fn contain_geometry_centers_letterbox_and_clips_cells() {
+        let data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            20,
+            10,
+            vec![0; 20 * 10 * 4],
+        )));
+        let placement = KittyVirtualPlacement {
+            image_id: 1,
+            placement_id: Some(2),
+            columns: 2,
+            rows: 2,
+            image_width: 20,
+            image_height: 10,
+            data,
+            order: 0,
+        };
+        let top = kitty_placeholder_image_cell(&placement, 0, 0, 10, 10).unwrap();
+        assert_eq!(top.padding(), (0, 5, 0, 0));
+        assert_eq!(top.top_left().y.into_inner(), 0.0);
+        assert_eq!(top.bottom_right().y.into_inner(), 0.5);
+
+        let bottom = kitty_placeholder_image_cell(&placement, 1, 1, 10, 10).unwrap();
+        assert_eq!(bottom.padding(), (0, 0, 0, 5));
+        assert_eq!(bottom.top_left().y.into_inner(), 0.5);
+        assert_eq!(bottom.bottom_right().y.into_inner(), 1.0);
+        assert!(kitty_placeholder_image_cell(&placement, 2, 0, 10, 10).is_none());
+    }
 }

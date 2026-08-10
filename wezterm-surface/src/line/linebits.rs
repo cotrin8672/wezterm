@@ -49,5 +49,10 @@ bitflags! {
         /// Otherwise, the auto-detect direction is used, falling back
         /// to the direction specified by the RTL bit.
         const AUTO_DETECT_DIRECTION = 1<<8;
+
+        /// The line has contained a Kitty Unicode placeholder.  This is a
+        /// conservative marker: false positives are allowed so that image
+        /// lifecycle refreshes never miss a line after edits or reflow.
+        const HAS_KITTY_UNICODE_PLACEHOLDER = 1<<9;
     }
 }

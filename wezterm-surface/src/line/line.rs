@@ -765,6 +765,9 @@ impl Line {
         attr: CellAttributes,
         seqno: SequenceNo,
     ) {
+        if text.starts_with('\u{10eeee}') {
+            self.bits |= LineBits::HAS_KITTY_UNICODE_PLACEHOLDER;
+        }
         if attr.hyperlink().is_some() {
             self.bits |= LineBits::HAS_HYPERLINK;
         }
@@ -790,6 +793,13 @@ impl Line {
         }
 
         self.set_cell(idx, Cell::new_grapheme_with_width(text, width, attr), seqno);
+    }
+
+    pub fn has_kitty_unicode_placeholder(&self) -> bool {
+        self.bits.contains(LineBits::HAS_KITTY_UNICODE_PLACEHOLDER)
+            || self
+                .visible_cells()
+                .any(|cell| cell.str().starts_with('\u{10eeee}'))
     }
 
     pub fn set_cell_clearing_image_placements(
@@ -818,6 +828,9 @@ impl Line {
         self.invalidate_implicit_hyperlinks(seqno);
         self.invalidate_zones();
         self.update_last_change_seqno(seqno);
+        if cell.str().starts_with('\u{10eeee}') {
+            self.bits |= LineBits::HAS_KITTY_UNICODE_PLACEHOLDER;
+        }
         if cell.attrs().hyperlink().is_some() {
             self.bits |= LineBits::HAS_HYPERLINK;
         }
