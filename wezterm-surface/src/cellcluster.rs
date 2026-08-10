@@ -60,7 +60,15 @@ impl CellCluster {
         for c in iter {
             let cell_idx = c.cell_index();
             let presentation = c.presentation();
-            let cell_str = c.str();
+            // Unicode placeholders remain intact in the terminal model for
+            // copy/reflow/redraw semantics, but the base character and its
+            // diacritics must never reach the font shaper (which would render
+            // a tofu glyph through transparent image pixels).
+            let cell_str = if c.str().starts_with('\u{10eeee}') {
+                " "
+            } else {
+                c.str()
+            };
             let normalized_attr = if c.attrs().wrapped() {
                 let mut attr_storage = c.attrs().clone();
                 attr_storage.set_wrapped(false);
@@ -306,5 +314,22 @@ impl CellCluster {
             }
         }
         self.text.push_str(text);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::{Line, SequenceNo};
+
+    #[test]
+    fn kitty_unicode_placeholder_is_blank_only_in_render_cluster() {
+        let raw = "\u{10eeee}\u{0305}\u{0305}";
+        let line = Line::from_text(raw, &CellAttributes::default(), SequenceNo::default(), None);
+        let clusters = CellCluster::make_cluster(8, line.visible_cells(), None);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].text, " ");
+        assert_eq!(clusters[0].width, 1);
+        assert_eq!(line.visible_cells().next().unwrap().str(), raw);
     }
 }
