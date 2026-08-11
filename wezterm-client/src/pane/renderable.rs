@@ -655,10 +655,15 @@ pub(crate) async fn hydrate_lines(
     let mut requests: HashMap<[u8; 32], Vec<GetImageCell>> = HashMap::new();
     let mut data_by_hash = HashMap::new();
     for im in &image_cells {
-        if let Some(data) = IMAGE_LRU.lock().unwrap().get(&im.data_hash) {
-            data_by_hash.insert(im.data_hash, Arc::clone(data));
-        } else {
-            let candidates = requests.entry(im.data_hash).or_default();
+        // A placeholder grid can contain thousands of cells backed by the
+        // same image.  Check the process-local cache once per hash instead of
+        // taking the global mutex for every cell.  Missing hashes are already
+        // represented in `requests`, so subsequent cells only contribute
+        // fallback coordinates (up to the bounded candidate limit).
+        if data_by_hash.contains_key(&im.data_hash) {
+            continue;
+        }
+        if let Some(candidates) = requests.get_mut(&im.data_hash) {
             if candidates.len() < MAX_IMAGE_CELL_CANDIDATES {
                 candidates.push(GetImageCell {
                     pane_id,
@@ -667,6 +672,20 @@ pub(crate) async fn hydrate_lines(
                     data_hash: im.data_hash,
                 });
             }
+            continue;
+        }
+        if let Some(data) = IMAGE_LRU.lock().unwrap().get(&im.data_hash) {
+            data_by_hash.insert(im.data_hash, Arc::clone(data));
+        } else {
+            requests.insert(
+                im.data_hash,
+                vec![GetImageCell {
+                    pane_id,
+                    line_idx: im.line_idx,
+                    cell_idx: im.cell_idx,
+                    data_hash: im.data_hash,
+                }],
+            );
         }
     }
 
