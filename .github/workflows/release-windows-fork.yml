@@ -1,0 +1,212 @@
+name: release-windows-fork
+
+on:
+  push:
+    tags:
+      - "20*"
+
+concurrency:
+  group: release-windows-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository != 'wezterm/wezterm'
+    runs-on: "windows-2025"
+    env:
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      RUSTUP_WINDOWS_PATH_ADD_BIN: "1"
+      TAG_NAME: ${{ github.ref_name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: x86_64-pc-windows-msvc
+
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache vendored dependencies
+        uses: actions/cache@v4
+        id: cache-cargo-vendor
+        with:
+          path: |
+            vendor
+            .cargo/config
+          key: cargo-deps-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Vendor dependencies
+        if: steps.cache-cargo-vendor.outputs.cache-hit != 'true'
+        shell: bash
+        run: cargo vendor --locked --versioned-dirs >> .cargo/config
+
+      - name: Pin release version
+        shell: bash
+        run: printf '%s\n' "$TAG_NAME" > .tag
+
+      - name: Build wezterm
+        shell: cmd
+        run: |
+          PATH C:\Strawberry\perl\bin;%PATH%
+          cargo build --locked -p wezterm --release
+
+      - name: Build wezterm-gui
+        shell: cmd
+        run: |
+          PATH C:\Strawberry\perl\bin;%PATH%
+          cargo build --locked -p wezterm-gui --release
+
+      - name: Build wezterm-mux-server
+        shell: cmd
+        run: |
+          PATH C:\Strawberry\perl\bin;%PATH%
+          cargo build --locked -p wezterm-mux-server --release
+
+      - name: Build strip-ansi-escapes
+        shell: cmd
+        run: |
+          PATH C:\Strawberry\perl\bin;%PATH%
+          cargo build --locked -p strip-ansi-escapes --release
+
+      - name: Install cargo-nextest
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-nextest
+          cache-key: windows
+
+      - name: Test
+        shell: cmd
+        run: |
+          PATH C:\Strawberry\perl\bin;%PATH%
+          cargo nextest run --all --no-fail-fast
+
+      - name: Package Windows artifacts
+        shell: bash
+        run: bash ci/deploy.sh
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-release
+          path: |
+            WezTerm-*.zip
+            WezTerm-*.exe
+
+  release:
+    if: github.repository != 'wezterm/wezterm'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG_NAME: ${{ github.ref_name }}
+
+    steps:
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-release
+          path: dist
+
+      - name: Create checksums and Scoop manifest
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          zip_files=(dist/WezTerm-*.zip)
+          if (( ${#zip_files[@]} != 1 )); then
+            echo "expected exactly one Windows ZIP, found ${#zip_files[@]}" >&2
+            exit 1
+          fi
+          zip_file="${zip_files[0]}"
+          zip_name="$(basename "$zip_file")"
+          zip_hash="$(sha256sum "$zip_file" | awk '{print $1}')"
+
+          for file in dist/WezTerm-*.zip dist/WezTerm-*.exe; do
+            sha256sum "$file" > "$file.sha256"
+          done
+
+          cat > dist/wezterm-kitty.json <<EOF
+          {
+            "version": "${TAG_NAME}",
+            "description": "WezTerm with Kitty Unicode placeholder support",
+            "homepage": "https://github.com/${REPOSITORY}",
+            "license": "MIT",
+            "architecture": {
+              "64bit": {
+                "url": "https://github.com/${REPOSITORY}/releases/download/${TAG_NAME}/${zip_name}",
+                "hash": "${zip_hash}"
+              }
+            },
+            "extract_dir": "WezTerm-windows-${TAG_NAME}",
+            "bin": [
+              ["wezterm.exe", "wezterm"],
+              ["wezterm-gui.exe", "wezterm-gui"]
+            ],
+            "shortcuts": [
+              ["wezterm-gui.exe", "WezTerm Kitty"]
+            ],
+            "checkver": {
+              "github": "https://github.com/${REPOSITORY}"
+            },
+            "autoupdate": {
+              "architecture": {
+                "64bit": {
+                  "url": "https://github.com/${REPOSITORY}/releases/download/\$version/WezTerm-windows-\$version.zip"
+                }
+              },
+              "extract_dir": "WezTerm-windows-\$version"
+            }
+          }
+          EOF
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG_NAME" \
+            --repo "$REPOSITORY" \
+            --verify-tag \
+            --title "WezTerm Kitty ${TAG_NAME}" \
+            --generate-notes \
+            dist/WezTerm-*.zip \
+            dist/WezTerm-*.exe \
+            dist/*.sha256 \
+            dist/wezterm-kitty.json
+
+      - name: Checkout main for Scoop manifest update
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          path: repo
+
+      - name: Update Scoop bucket manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p repo/bucket
+          cp dist/wezterm-kitty.json repo/bucket/wezterm-kitty.json
+          cd repo
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bucket/wezterm-kitty.json
+          if git diff --cached --quiet; then
+            echo "Scoop manifest is already up to date"
+            exit 0
+          fi
+          git commit -m "Update Scoop manifest for ${TAG_NAME}"
+          git push origin HEAD:main
