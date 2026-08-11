@@ -190,14 +190,19 @@ fn kitty_placeholder_redraw_reuses_existing_attachment() {
     term.print(transmit);
     term.print(placeholder.as_bytes());
     let before = term.term.kitty_placeholder_refresh_stats();
+    let before_seqno = term.term.screen().visible_lines()[0].current_seqno();
 
     // Neovim can redraw the same virtual text without changing its decoded
     // image cell.  Rewriting the placeholder must not allocate and attach a
     // replacement ImageCell just because the terminal cell was written again.
-    term.print(format!("\r{placeholder}").as_bytes());
+    term.print(format!("\x1b[1G{placeholder}").as_bytes());
 
     let after = term.term.kitty_placeholder_refresh_stats();
-    k9::assert_equal!(after.2, before.2);
+    k9::assert_equal!(after, before);
+    k9::assert_equal!(
+        term.term.screen().visible_lines()[0].current_seqno(),
+        before_seqno
+    );
     assert!(term.term.screen().visible_lines()[0]
         .visible_cells()
         .next()

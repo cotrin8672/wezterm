@@ -363,6 +363,93 @@ impl CellAttributes {
 
 #[cfg(feature = "use_image")]
 impl CellAttributes {
+    /// Clone attributes for text shaping without copying derived Kitty
+    /// Unicode placeholder images.  The images remain attached to the
+    /// terminal cells and are collected by the renderer separately; keeping
+    /// them out of the shaping attributes allows adjacent placeholder cells
+    /// to share one text cluster.
+    pub fn clone_without_kitty_unicode_images(&self) -> Self {
+        let mut result = Self {
+            attributes: self.attributes,
+            foreground: self.foreground,
+            background: self.background,
+            fat: None,
+        };
+
+        if let Some(fat) = self.fat.as_ref() {
+            let has_non_kitty_image = fat.image.iter().any(|image| {
+                image.attachment_kind() != image::ImageCellAttachmentKind::KittyUnicodePlaceholder
+            });
+            if !has_non_kitty_image
+                && fat.hyperlink.is_none()
+                && fat.underline_color == ColorAttribute::Default
+                && fat.foreground == ColorAttribute::Default
+                && fat.background == ColorAttribute::Default
+            {
+                return result;
+            }
+
+            let mut filtered = FatAttributes {
+                hyperlink: fat.hyperlink.clone(),
+                image: Vec::new(),
+                underline_color: fat.underline_color,
+                foreground: fat.foreground,
+                background: fat.background,
+            };
+            if has_non_kitty_image {
+                filtered.image.extend(
+                    fat.image
+                        .iter()
+                        .filter(|image| {
+                            image.attachment_kind()
+                                != image::ImageCellAttachmentKind::KittyUnicodePlaceholder
+                        })
+                        .map(|image| Box::new(image.as_ref().clone())),
+                );
+            }
+            result.fat = Some(Box::new(filtered));
+            result.deallocate_fat_attributes_if_none();
+        }
+
+        result
+    }
+
+    /// Compare the cell styling while ignoring image attachments.
+    ///
+    /// Kitty Unicode placeholder images are derived from the cell text and
+    /// colors.  A terminal redraw can therefore present the same textual
+    /// cell again while the previous derived image is still attached.  This
+    /// comparison lets the surface layer skip that write without cloning or
+    /// allocating the image attachment.  It deliberately includes every
+    /// other fat attribute (hyperlink and explicit colors), so an actual
+    /// style change is never hidden by the optimization.
+    pub fn same_non_image_contents(&self, other: &Self) -> bool {
+        if self.attributes != other.attributes
+            || self.foreground != other.foreground
+            || self.background != other.background
+        {
+            return false;
+        }
+
+        fn fat_contents_equal(a: &FatAttributes, b: &FatAttributes) -> bool {
+            a.hyperlink == b.hyperlink
+                && a.underline_color == b.underline_color
+                && a.foreground == b.foreground
+                && a.background == b.background
+        }
+
+        match (&self.fat, &other.fat) {
+            (None, None) => true,
+            (Some(a), Some(b)) => fat_contents_equal(a, b),
+            (Some(a), None) | (None, Some(a)) => {
+                a.hyperlink.is_none()
+                    && a.underline_color == ColorAttribute::Default
+                    && a.foreground == ColorAttribute::Default
+                    && a.background == ColorAttribute::Default
+            }
+        }
+    }
+
     /// Assign a single image to a cell.
     pub fn set_image(&mut self, image: Box<ImageCell>) -> &mut Self {
         self.allocate_fat_attributes();
@@ -404,15 +491,7 @@ impl CellAttributes {
         kind: image::ImageCellAttachmentKind,
         replacement: Option<ImageCell>,
     ) -> bool {
-        let unchanged = self.fat.as_ref().map_or(replacement.is_none(), |fat| {
-            let mut matching = fat.image.iter().filter(|im| im.attachment_kind() == kind);
-            let first = matching.next();
-            match (first, matching.next(), replacement.as_ref()) {
-                (None, None, None) => true,
-                (Some(existing), None, Some(replacement)) => existing.as_ref() == replacement,
-                _ => false,
-            }
-        });
+        let unchanged = self.image_by_kind_matches(kind, replacement.as_ref());
         if unchanged {
             return false;
         }
@@ -422,6 +501,43 @@ impl CellAttributes {
             self.attach_image(Box::new(image));
         }
         true
+    }
+
+    /// Replace an image attachment without cloning the replacement unless its
+    /// value differs from the existing attachment.  Placeholder reconciliation
+    /// can call this with a cached tile borrowed from the prepared placement,
+    /// avoiding one ImageCell/Arc clone per cell on style-only redraws.
+    pub fn replace_image_by_kind_ref(
+        &mut self,
+        kind: image::ImageCellAttachmentKind,
+        replacement: Option<&ImageCell>,
+    ) -> bool {
+        if self.image_by_kind_matches(kind, replacement) {
+            return false;
+        }
+
+        self.detach_images_by_kind(kind);
+        if let Some(image) = replacement {
+            self.attach_image(Box::new(image.clone()));
+        }
+        true
+    }
+
+    fn image_by_kind_matches(
+        &self,
+        kind: image::ImageCellAttachmentKind,
+        replacement: Option<&ImageCell>,
+    ) -> bool {
+        let unchanged = self.fat.as_ref().map_or(replacement.is_none(), |fat| {
+            let mut matching = fat.image.iter().filter(|im| im.attachment_kind() == kind);
+            let first = matching.next();
+            match (first, matching.next(), replacement) {
+                (None, None, None) => true,
+                (Some(existing), None, Some(replacement)) => existing.as_ref() == replacement,
+                _ => false,
+            }
+        });
+        unchanged
     }
 
     /// Add an image attachement, preserving any existing attachments.

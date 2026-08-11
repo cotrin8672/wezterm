@@ -63,6 +63,12 @@ struct PreparedKittyVirtualPlacement {
     cell_width: usize,
     cell_height: usize,
     geometry: Option<KittyPlaceholderGeometry>,
+    // A placeholder grid is normally small (Snacks uses at most 80x40).
+    // Cache the derived cell slices so that a placement refresh does the
+    // floating point geometry work once instead of once per cell.  Very large
+    // protocol dimensions stay on the bounded, lazy path below rather than
+    // allowing an untrusted c/r pair to allocate an enormous vector.
+    tiles: Option<Vec<Option<ImageCell>>>,
 }
 
 impl PreparedKittyVirtualPlacement {
@@ -77,15 +83,36 @@ impl PreparedKittyVirtualPlacement {
             }
             let cell_width_u32 = u32::try_from(cell_width).ok()?;
             let cell_height_u32 = u32::try_from(cell_height).ok()?;
-            let columns = if placement.columns == 0 {
-                placement.image_width.div_ceil(cell_width_u32)
-            } else {
-                placement.columns
-            };
-            let rows = if placement.rows == 0 {
-                placement.image_height.div_ceil(cell_height_u32)
-            } else {
-                placement.rows
+            let natural_columns = placement.image_width.div_ceil(cell_width_u32);
+            let natural_rows = placement.image_height.div_ceil(cell_height_u32);
+            let (columns, rows) = match (placement.columns, placement.rows) {
+                (0, 0) => (natural_columns, natural_rows),
+                (columns, 0) => {
+                    // If only one grid dimension is specified, derive the
+                    // other from the source aspect ratio and the terminal
+                    // cell aspect ratio.  Deriving the missing dimension
+                    // independently from the raw pixels introduces visible
+                    // letterboxing for non-square cells.
+                    let grid_width = f64::from(columns) * cell_width as f64;
+                    let grid_height = grid_width * f64::from(placement.image_height)
+                        / f64::from(placement.image_width);
+                    let rows = (grid_height / cell_height as f64).ceil();
+                    if !rows.is_finite() || rows < 1.0 || rows > u32::MAX as f64 {
+                        return None;
+                    }
+                    (columns, rows as u32)
+                }
+                (0, rows) => {
+                    let grid_height = f64::from(rows) * cell_height as f64;
+                    let grid_width = grid_height * f64::from(placement.image_width)
+                        / f64::from(placement.image_height);
+                    let columns = (grid_width / cell_width as f64).ceil();
+                    if !columns.is_finite() || columns < 1.0 || columns > u32::MAX as f64 {
+                        return None;
+                    }
+                    (columns as u32, rows)
+                }
+                (columns, rows) => (columns, rows),
             };
             if columns == 0 || rows == 0 {
                 return None;
@@ -110,17 +137,54 @@ impl PreparedKittyVirtualPlacement {
             })
         })();
 
-        Self {
+        let mut result = Self {
             image_id: placement.image_id,
             placement_id: placement.placement_id,
             data: Arc::clone(&placement.data),
             cell_width,
             cell_height,
             geometry,
+            tiles: None,
+        };
+
+        if let Some(geometry) = result.geometry.as_ref() {
+            const MAX_CACHED_PLACEHOLDER_TILES: usize = 65_536;
+            let tile_count = geometry
+                .columns
+                .checked_mul(geometry.rows)
+                .and_then(|count| usize::try_from(count).ok())
+                .filter(|count| *count <= MAX_CACHED_PLACEHOLDER_TILES);
+            if let Some(tile_count) = tile_count {
+                let mut tiles = Vec::with_capacity(tile_count);
+                for row in 0..geometry.rows {
+                    for column in 0..geometry.columns {
+                        tiles.push(result.compute_image_cell(row, column));
+                    }
+                }
+                result.tiles = Some(tiles);
+            }
         }
+
+        result
     }
 
     fn image_cell(&self, row: u32, column: u32) -> Option<ImageCell> {
+        if let Some(tiles) = &self.tiles {
+            let geometry = self.geometry.as_ref()?;
+            let index = row.checked_mul(geometry.columns)?.checked_add(column)?;
+            return tiles.get(usize::try_from(index).ok()?)?.clone();
+        }
+        self.compute_image_cell(row, column)
+    }
+
+    fn image_cell_ref(&self, row: u32, column: u32) -> Option<&ImageCell> {
+        let tiles = self.tiles.as_ref()?;
+        let geometry = self.geometry.as_ref()?;
+        let index = row.checked_mul(geometry.columns)?.checked_add(column)?;
+        tiles.get(usize::try_from(index).ok()?)?.as_ref()
+    }
+
+    fn compute_image_cell(&self, row: u32, column: u32) -> Option<ImageCell> {
         let geometry = self.geometry.as_ref()?;
         if column >= geometry.columns || row >= geometry.rows {
             return None;
@@ -442,23 +506,38 @@ impl TerminalState {
             let foreground = cell.attrs().foreground();
             let underline = cell.attrs().underline_color();
             let run = decode_kitty_placeholder_cell(cell.str(), foreground, underline, previous);
-            let replacement = if let Some(run) = run {
+            let changed = if let Some(run) = run {
                 has_placeholder = true;
                 previous = Some(run);
                 let image_id = kitty_color_id(foreground) | (run.high << 24);
                 let requested_placement = kitty_color_id(underline);
-                placements
-                    .resolve(image_id, requested_placement)
-                    .and_then(|placement| placement.image_cell(run.row, run.column))
+                match placements.resolve(image_id, requested_placement) {
+                    Some(placement) => {
+                        if let Some(image) = placement.image_cell_ref(run.row, run.column) {
+                            cell.attrs_mut().replace_image_by_kind_ref(
+                                ImageCellAttachmentKind::KittyUnicodePlaceholder,
+                                Some(image),
+                            )
+                        } else {
+                            let replacement = placement.image_cell(run.row, run.column);
+                            cell.attrs_mut().replace_image_by_kind(
+                                ImageCellAttachmentKind::KittyUnicodePlaceholder,
+                                replacement,
+                            )
+                        }
+                    }
+                    None => cell.attrs_mut().replace_image_by_kind(
+                        ImageCellAttachmentKind::KittyUnicodePlaceholder,
+                        None,
+                    ),
+                }
             } else {
                 previous = None;
-                None
+                cell.attrs_mut()
+                    .replace_image_by_kind(ImageCellAttachmentKind::KittyUnicodePlaceholder, None)
             };
 
-            if cell.attrs_mut().replace_image_by_kind(
-                ImageCellAttachmentKind::KittyUnicodePlaceholder,
-                replacement,
-            ) {
+            if changed {
                 attachment_updates += 1;
             }
         }
@@ -829,7 +908,7 @@ impl TerminalState {
                                     || (placement_id.is_some()
                                         && candidate.placement_id != placement_id)
                             });
-                            if delete {
+                            if delete && !self.kitty_image_is_referenced(image_id) {
                                 self.kitty_img.remove_data_for_id(image_id);
                             }
                             self.refresh_kitty_unicode_placeholders();
@@ -862,7 +941,7 @@ impl TerminalState {
                                         || (placement_id.is_some()
                                             && candidate.placement_id != placement_id)
                                 });
-                                if delete {
+                                if delete && !self.kitty_image_is_referenced(image_id) {
                                     self.kitty_img.remove_data_for_id(image_id);
                                 }
                                 self.refresh_kitty_unicode_placeholders();
@@ -1028,6 +1107,18 @@ impl TerminalState {
             self.kitty_img.id_to_data.len(),
             self.kitty_img.used_memory,
         );
+    }
+
+    fn kitty_image_is_referenced(&self, image_id: u32) -> bool {
+        self.kitty_img
+            .placements
+            .keys()
+            .any(|(id, _)| *id == image_id)
+            || self
+                .kitty_img
+                .virtual_placements
+                .iter()
+                .any(|placement| placement.image_id == image_id)
     }
 
     fn kitty_retire_image_id(&mut self, image_id: u32) {
@@ -1777,5 +1868,27 @@ mod unicode_placeholder_test {
         assert_eq!(bottom.top_left().y.into_inner(), 0.5);
         assert_eq!(bottom.bottom_right().y.into_inner(), 1.0);
         assert!(kitty_placeholder_image_cell(&placement, 2, 0, 10, 10).is_none());
+    }
+
+    #[test]
+    fn one_explicit_grid_dimension_preserves_image_aspect_ratio() {
+        let data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            100,
+            100,
+            vec![0; 100 * 100 * 4],
+        )));
+        let placement = KittyVirtualPlacement {
+            image_id: 1,
+            placement_id: None,
+            columns: 20,
+            rows: 0,
+            image_width: 100,
+            image_height: 100,
+            data,
+        };
+        let prepared = PreparedKittyVirtualPlacement::new(&placement, 10, 20);
+        let geometry = prepared.geometry.as_ref().unwrap();
+        assert_eq!((geometry.columns, geometry.rows), (20, 10));
+        assert!(prepared.tiles.is_some());
     }
 }

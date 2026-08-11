@@ -283,13 +283,10 @@ impl<'a> Performer<'a> {
                     None
                 }
             };
-            if let Some(stable_row) = placeholder_stable_row {
-                self.kitty_placeholder_dirty_rows.insert(stable_row);
-            }
-
             let pen = self.pen.clone();
 
             let wrappable = x + print_width >= width;
+            let inserted_cell = self.insert;
 
             if self.insert {
                 let margin = self.left_and_right_margins.end;
@@ -309,8 +306,19 @@ impl<'a> Performer<'a> {
                 g,
                 self.pen
             );
-            self.screen_mut()
-                .set_cell_grapheme(x, y, g, print_width, pen, seqno);
+            let cell_changed =
+                self.screen_mut()
+                    .set_cell_grapheme_if_changed(x, y, g, print_width, pen, seqno);
+
+            if let Some(stable_row) = placeholder_stable_row {
+                // A repeated placeholder write can be a true no-op: the
+                // existing derived ImageCell and all non-image attributes
+                // already match.  Do not rescan that row unless the cell
+                // contents or an insert operation actually changed it.
+                if cell_changed || inserted_cell {
+                    self.kitty_placeholder_dirty_rows.insert(stable_row);
+                }
+            }
 
             if !wrappable {
                 self.cursor.x += print_width;

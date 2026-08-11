@@ -1,5 +1,4 @@
 use crate::line::CellRef;
-use alloc::borrow::Cow;
 use wezterm_bidi::{BidiContext, Direction, ParagraphDirectionHint};
 use wezterm_cell::CellAttributes;
 use wezterm_char_props::emoji::Presentation;
@@ -69,13 +68,13 @@ impl CellCluster {
             } else {
                 c.str()
             };
-            let normalized_attr = if c.attrs().wrapped() {
-                let mut attr_storage = c.attrs().clone();
-                attr_storage.set_wrapped(false);
-                Cow::Owned(attr_storage)
-            } else {
-                Cow::Borrowed(c.attrs())
-            };
+            #[cfg(feature = "use_image")]
+            let mut normalized_attr = c.attrs().clone_without_kitty_unicode_images();
+            #[cfg(not(feature = "use_image"))]
+            let mut normalized_attr = c.attrs().clone();
+            if normalized_attr.wrapped() {
+                normalized_attr.set_wrapped(false);
+            }
 
             last_cluster = match last_cluster.take() {
                 None => {
@@ -85,14 +84,14 @@ impl CellCluster {
                     Some(CellCluster::new(
                         hint,
                         presentation,
-                        normalized_attr.into_owned(),
+                        normalized_attr.clone(),
                         cell_str,
                         cell_idx,
                         c.width(),
                     ))
                 }
                 Some(mut last) => {
-                    if last.attrs != *normalized_attr || last.presentation != presentation {
+                    if last.attrs != normalized_attr || last.presentation != presentation {
                         // Flush pending cluster and start a new one
                         clusters.push(last);
 
@@ -101,7 +100,7 @@ impl CellCluster {
                         Some(CellCluster::new(
                             hint,
                             presentation,
-                            normalized_attr.into_owned(),
+                            normalized_attr.clone(),
                             cell_str,
                             cell_idx,
                             c.width(),
@@ -141,7 +140,7 @@ impl CellCluster {
                             Some(CellCluster::new(
                                 hint,
                                 presentation,
-                                normalized_attr.into_owned(),
+                                normalized_attr.clone(),
                                 cell_str,
                                 cell_idx,
                                 c.width(),

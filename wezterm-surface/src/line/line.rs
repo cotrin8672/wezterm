@@ -756,7 +756,15 @@ impl Line {
     /// Similarly, when we assign a cell, we need to blank out those
     /// occluded successor cells.
     pub fn set_cell(&mut self, idx: usize, cell: Cell, seqno: SequenceNo) {
+        self.set_cell_if_changed(idx, cell, seqno);
+    }
+
+    pub fn set_cell_if_changed(&mut self, idx: usize, cell: Cell, seqno: SequenceNo) -> bool {
+        if self.can_skip_kitty_placeholder_rewrite(idx, &cell) {
+            return false;
+        }
         self.set_cell_impl(idx, cell, false, seqno);
+        true
     }
 
     /// Assign a cell using grapheme text with a known width and attributes.
@@ -772,6 +780,20 @@ impl Line {
         attr: CellAttributes,
         seqno: SequenceNo,
     ) {
+        self.set_cell_grapheme_if_changed(idx, text, width, attr, seqno);
+    }
+
+    pub fn set_cell_grapheme_if_changed(
+        &mut self,
+        idx: usize,
+        text: &str,
+        width: usize,
+        attr: CellAttributes,
+        seqno: SequenceNo,
+    ) -> bool {
+        if self.can_skip_kitty_placeholder_grapheme(idx, text, width, &attr) {
+            return false;
+        }
         if text.starts_with('\u{10eeee}') {
             self.bits |= LineBits::HAS_KITTY_UNICODE_PLACEHOLDER;
         }
@@ -783,7 +805,7 @@ impl Line {
             if idx > cl.len() && text == " " && attr == CellAttributes::blank() {
                 // Appending blank beyond end of line; is already
                 // implicitly blank
-                return;
+                return false;
             }
             while cl.len() < idx {
                 // Fill out any implied blanks until we can append
@@ -795,11 +817,69 @@ impl Line {
                 self.invalidate_implicit_hyperlinks(seqno);
                 self.invalidate_zones();
                 self.update_last_change_seqno(seqno);
-                return;
+                return true;
             }
         }
 
-        self.set_cell(idx, Cell::new_grapheme_with_width(text, width, attr), seqno);
+        self.set_cell_if_changed(idx, Cell::new_grapheme_with_width(text, width, attr), seqno)
+    }
+
+    #[cfg(feature = "use_image")]
+    fn can_skip_kitty_placeholder_grapheme(
+        &self,
+        idx: usize,
+        text: &str,
+        width: usize,
+        attr: &CellAttributes,
+    ) -> bool {
+        if !text.starts_with('\u{10eeee}') || attr.images_ref().is_some() {
+            return false;
+        }
+
+        match &self.cells {
+            CellStorage::V(cells) => cells.get(idx).is_some_and(|existing| {
+                existing.str() == text
+                    && existing.width() == width
+                    && attr.same_non_image_contents(existing.attrs())
+                    && existing.attrs().images_ref().is_some_and(|images| {
+                        let mut kitty_images = images.iter().filter(|image| {
+                            image.attachment_kind()
+                                == wezterm_cell::image::ImageCellAttachmentKind::
+                                    KittyUnicodePlaceholder
+                        });
+                        kitty_images.next().is_some()
+                            && kitty_images.next().is_none()
+                            && images.iter().all(|image| {
+                                image.should_preserve_on_cell_update()
+                                    || image.attachment_kind()
+                                        == wezterm_cell::image::ImageCellAttachmentKind::
+                                            KittyUnicodePlaceholder
+                            })
+                    })
+            }),
+            CellStorage::C(_) => false,
+        }
+    }
+
+    #[cfg(feature = "use_image")]
+    fn can_skip_kitty_placeholder_rewrite(&self, idx: usize, cell: &Cell) -> bool {
+        self.can_skip_kitty_placeholder_grapheme(idx, cell.str(), cell.width(), cell.attrs())
+    }
+
+    #[cfg(not(feature = "use_image"))]
+    fn can_skip_kitty_placeholder_rewrite(&self, _idx: usize, _cell: &Cell) -> bool {
+        false
+    }
+
+    #[cfg(not(feature = "use_image"))]
+    fn can_skip_kitty_placeholder_grapheme(
+        &self,
+        _idx: usize,
+        _text: &str,
+        _width: usize,
+        _attr: &CellAttributes,
+    ) -> bool {
+        false
     }
 
     pub fn has_kitty_unicode_placeholder(&self) -> bool {

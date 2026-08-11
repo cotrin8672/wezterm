@@ -37,7 +37,7 @@ impl<'a> CellRef<'a> {
         }
     }
 
-    pub fn attrs(&self) -> &CellAttributes {
+    pub fn attrs(&self) -> &'a CellAttributes {
         match self {
             Self::CellRef { cell, .. } => cell.attrs(),
             Self::ClusterRef { attrs, .. } => attrs,

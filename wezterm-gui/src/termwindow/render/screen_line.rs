@@ -425,9 +425,42 @@ impl crate::TermWindow {
         let mut background_images = vec![];
         let mut overlay_images = vec![];
 
-        // Number of cells we've rendered, starting from the edge of the line
-        let mut visual_cell_idx = 0;
+        // Kitty placeholder image attributes are intentionally omitted from
+        // CellCluster shaping so that a grid of spaces can share one cluster.
+        // Recover the image slices from the original cells here and retain
+        // the style color computed for the corresponding shaped range.
+        let has_shaped_images = shaped
+            .iter()
+            .any(|item| item.cluster.attrs.images_ref().is_some());
+        if params.line.has_kitty_unicode_placeholder() || has_shaped_images {
+            let mut cell_colors = vec![None; params.line.len()];
+            for item in shaped.iter() {
+                let start = item.cluster.first_cell_idx;
+                let end = (start + item.cluster.width).min(cell_colors.len());
+                for color in &mut cell_colors[start..end] {
+                    color.replace(item.fg_color);
+                }
+            }
 
+            for cell in params.line.visible_cells() {
+                let Some(images) = cell.attrs().images_ref() else {
+                    continue;
+                };
+                let glyph_color = cell_colors
+                    .get(cell.cell_index())
+                    .and_then(|color| *color)
+                    .unwrap_or(params.foreground);
+                for image in images {
+                    if image.z_index() < 0 {
+                        background_images.push((cell.cell_index(), image.as_ref(), glyph_color));
+                    } else {
+                        overlay_images.push((cell.cell_index(), image.as_ref(), glyph_color));
+                    }
+                }
+            }
+        }
+
+        // Number of cells we've rendered, starting from the edge of the line
         let mut cluster_x_pos = match direction {
             Direction::LeftToRight => 0.,
             Direction::RightToLeft => params.pixel_width,
@@ -436,7 +469,6 @@ impl crate::TermWindow {
         for item in shaped.iter() {
             let cluster = &item.cluster;
             let glyph_info = &item.glyph_info;
-            let images = cluster.attrs.images_ref().unwrap_or(&[]);
             let valign_adjust = match cluster.attrs.vertical_align() {
                 termwiz::cell::VerticalAlign::BaseLine => 0.,
                 termwiz::cell::VerticalAlign::SuperScript => {
@@ -446,10 +478,6 @@ impl crate::TermWindow {
                     params.render_metrics.cell_size.height as f32 * 0.25
                 }
             };
-
-            // TODO: remember logical/visual mapping for selection
-            #[allow(unused_variables, unused_assignments)]
-            let mut phys_cell_idx = cluster.first_cell_idx;
 
             // Pre-decrement by the cluster width when doing RTL,
             // so that we can render it right-justified
@@ -469,18 +497,6 @@ impl crate::TermWindow {
                         >= params.left_pixel_x + params.pixel_width
                 {
                     break;
-                }
-
-                for glyph_idx in 0..info.pos.num_cells as usize {
-                    for img in images {
-                        if img.z_index() < 0 {
-                            background_images.push((
-                                visual_cell_idx + glyph_idx,
-                                img.as_ref(),
-                                item.fg_color,
-                            ));
-                        }
-                    }
                 }
 
                 {
@@ -661,22 +677,6 @@ impl crate::TermWindow {
                     }
                 }
 
-                for glyph_idx in 0..info.pos.num_cells as usize {
-                    for img in images {
-                        if img.z_index() >= 0 {
-                            overlay_images.push((
-                                visual_cell_idx + glyph_idx,
-                                img.as_ref(),
-                                item.fg_color,
-                            ));
-                        }
-                    }
-                }
-                #[allow(unused_assignments)]
-                {
-                    phys_cell_idx += info.pos.num_cells as usize;
-                }
-                visual_cell_idx += info.pos.num_cells as usize;
                 cluster_x_pos += if params.use_pixel_positioning {
                     glyph.x_advance.get() as f32 * width_scale
                 } else {

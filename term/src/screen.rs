@@ -423,9 +423,21 @@ impl Screen {
         attr: CellAttributes,
         seqno: SequenceNo,
     ) {
+        self.set_cell_grapheme_if_changed(x, y, text, width, attr, seqno);
+    }
+
+    pub fn set_cell_grapheme_if_changed(
+        &mut self,
+        x: usize,
+        y: VisibleRowIndex,
+        text: &str,
+        width: usize,
+        attr: CellAttributes,
+        seqno: SequenceNo,
+    ) -> bool {
         let line_idx = self.phys_row(y);
         let line = self.line_mut(line_idx);
-        line.set_cell_grapheme(x, text, width, attr, seqno);
+        line.set_cell_grapheme_if_changed(x, text, width, attr, seqno)
     }
 
     pub fn cell_mut(&mut self, x: usize, y: VisibleRowIndex) -> Option<&mut Cell> {
