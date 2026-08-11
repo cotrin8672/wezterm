@@ -27,6 +27,10 @@ pub struct KittyImageState {
     id_to_data: HashMap<u32, Arc<ImageData>>,
     placements: HashMap<(u32, Option<u32>), PlacementInfo>,
     virtual_placements: Vec<KittyVirtualPlacement>,
+    // Prepared placement geometry is independent of the screen contents. It
+    // is reused across dirty-row reconciles and invalidated whenever the
+    // virtual placement set changes or the cell dimensions change.
+    prepared_placeholder_lookup: Option<(usize, usize, Arc<KittyPlaceholderPlacementLookup>)>,
     used_memory: usize,
     #[cfg(test)]
     placeholder_scan_count: usize,
@@ -47,6 +51,7 @@ struct KittyVirtualPlacement {
     data: Arc<ImageData>,
 }
 
+#[derive(Debug)]
 struct KittyPlaceholderGeometry {
     columns: u32,
     rows: u32,
@@ -56,6 +61,7 @@ struct KittyPlaceholderGeometry {
     image_top: f64,
 }
 
+#[derive(Debug)]
 struct PreparedKittyVirtualPlacement {
     image_id: u32,
     placement_id: Option<u32>,
@@ -186,6 +192,7 @@ impl PreparedKittyVirtualPlacement {
     }
 }
 
+#[derive(Debug)]
 struct KittyPlaceholderPlacementLookup {
     placements: Vec<PreparedKittyVirtualPlacement>,
     latest_by_image_id: HashMap<u32, usize>,
@@ -509,13 +516,36 @@ impl TerminalState {
         (self.pixel_width / columns, self.pixel_height / rows)
     }
 
-    pub(crate) fn refresh_kitty_unicode_placeholders(&mut self) {
-        let (cell_width, cell_height) = self.kitty_placeholder_refresh_geometry();
-        let placements = KittyPlaceholderPlacementLookup::new(
+    fn kitty_placeholder_lookup(
+        &mut self,
+        cell_width: usize,
+        cell_height: usize,
+    ) -> Arc<KittyPlaceholderPlacementLookup> {
+        if let Some((cached_width, cached_height, lookup)) =
+            self.kitty_img.prepared_placeholder_lookup.as_ref()
+        {
+            if *cached_width == cell_width && *cached_height == cell_height {
+                return Arc::clone(lookup);
+            }
+        }
+
+        let lookup = Arc::new(KittyPlaceholderPlacementLookup::new(
             &self.kitty_img.virtual_placements,
             cell_width,
             cell_height,
-        );
+        ));
+        self.kitty_img.prepared_placeholder_lookup =
+            Some((cell_width, cell_height, Arc::clone(&lookup)));
+        lookup
+    }
+
+    fn invalidate_kitty_placeholder_lookup(&mut self) {
+        self.kitty_img.prepared_placeholder_lookup = None;
+    }
+
+    pub(crate) fn refresh_kitty_unicode_placeholders(&mut self) {
+        let (cell_width, cell_height) = self.kitty_placeholder_refresh_geometry();
+        let placements = self.kitty_placeholder_lookup(cell_width, cell_height);
         let seqno = self.seqno;
         let mut _scan_count = 0;
         let mut _cell_scan_count = 0;
@@ -564,11 +594,7 @@ impl TerminalState {
         {
             return;
         }
-        let placements = KittyPlaceholderPlacementLookup::new(
-            &self.kitty_img.virtual_placements,
-            cell_width,
-            cell_height,
-        );
+        let placements = self.kitty_placeholder_lookup(cell_width, cell_height);
         let mut _scan_count = 0;
         let mut _cell_scan_count = 0;
         let mut _attachment_update_count = 0;
@@ -660,6 +686,7 @@ impl TerminalState {
                     image_height,
                     data: img,
                 });
+            self.invalidate_kitty_placeholder_lookup();
             self.refresh_kitty_unicode_placeholders();
             return Ok(());
         }
@@ -872,6 +899,7 @@ impl TerminalState {
                                     || (placement_id.is_some()
                                         && candidate.placement_id != placement_id)
                             });
+                            self.invalidate_kitty_placeholder_lookup();
                             if delete && !self.kitty_image_is_referenced(image_id) {
                                 self.kitty_img.remove_data_for_id(image_id);
                             }
@@ -905,6 +933,7 @@ impl TerminalState {
                                         || (placement_id.is_some()
                                             && candidate.placement_id != placement_id)
                                 });
+                                self.invalidate_kitty_placeholder_lookup();
                                 if delete && !self.kitty_image_is_referenced(image_id) {
                                     self.kitty_img.remove_data_for_id(image_id);
                                 }
@@ -946,6 +975,7 @@ impl TerminalState {
                                     self.kitty_img
                                         .virtual_placements
                                         .retain(|p| p.image_id != image_id);
+                                    self.invalidate_kitty_placeholder_lookup();
                                     if delete {
                                         self.kitty_img.remove_data_for_id(image_id);
                                     }
@@ -1090,6 +1120,7 @@ impl TerminalState {
         self.kitty_img
             .virtual_placements
             .retain(|placement| placement.image_id != image_id);
+        self.invalidate_kitty_placeholder_lookup();
         self.kitty_img.remove_data_for_id(image_id);
         self.kitty_img
             .number_to_id
