@@ -311,6 +311,19 @@ impl VTActor for CollectingVTActor {
 const MAX_INTERMEDIATES: usize = 2;
 const MAX_OSC: usize = 64;
 const MAX_PARAMS: usize = 256;
+// Keep ordinary control strings allocated for reuse, but do not retain a
+// pathological payload indefinitely on a long-lived parser.
+#[cfg(any(feature = "std", feature = "alloc"))]
+const MAX_RETAINED_BUFFER_CAPACITY: usize = 64 * 1024;
+
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[inline]
+fn clear_buffer(buffer: &mut Vec<u8>) {
+    buffer.clear();
+    if buffer.capacity() > MAX_RETAINED_BUFFER_CAPACITY {
+        buffer.shrink_to_fit();
+    }
+}
 
 struct OscState {
     #[cfg(any(feature = "std", feature = "alloc"))]
@@ -534,10 +547,8 @@ impl VTParser {
                 self.current_param.take();
                 #[cfg(any(feature = "std", feature = "alloc"))]
                 {
-                    self.apc_data.clear();
-                    self.apc_data.shrink_to_fit();
-                    self.osc.buffer.clear();
-                    self.osc.buffer.shrink_to_fit();
+                    clear_buffer(&mut self.apc_data);
+                    clear_buffer(&mut self.osc.buffer);
                 }
             }
             Action::Collect => {
@@ -610,9 +621,10 @@ impl VTParser {
             }
             Action::Unhook => actor.dcs_unhook(),
             Action::OscStart => {
-                self.osc.buffer.clear();
                 #[cfg(any(feature = "std", feature = "alloc"))]
-                self.osc.buffer.shrink_to_fit();
+                clear_buffer(&mut self.osc.buffer);
+                #[cfg(not(any(feature = "std", feature = "alloc")))]
+                self.osc.buffer.clear();
                 self.osc.num_params = 0;
                 self.osc.full = false;
             }
@@ -640,10 +652,7 @@ impl VTParser {
 
             Action::ApcStart => {
                 #[cfg(any(feature = "std", feature = "alloc"))]
-                {
-                    self.apc_data.clear();
-                    self.apc_data.shrink_to_fit();
-                }
+                clear_buffer(&mut self.apc_data);
             }
             Action::ApcPut => {
                 #[cfg(any(feature = "std", feature = "alloc"))]
@@ -824,6 +833,39 @@ mod test {
                 b"hello".to_vec()
             ])]
         );
+    }
+
+    #[test]
+    fn osc_buffer_capacity_is_reused() {
+        let mut parser = VTParser::new();
+        let mut actor = CollectingVTActor::default();
+        let mut input = Vec::with_capacity(4 + 4096 + 1);
+        input.extend_from_slice(b"\x1b]0;");
+        input.extend(std::iter::repeat(b'x').take(4096));
+        input.push(b'\x07');
+
+        parser.parse(&input, &mut actor);
+        let retained_capacity = parser.osc.buffer.capacity();
+        assert!(retained_capacity >= 4096);
+
+        parser.parse(b"\x1b]1;x\x07", &mut actor);
+        assert_eq!(parser.osc.buffer.capacity(), retained_capacity);
+    }
+
+    #[test]
+    fn oversized_osc_buffer_is_released_at_sequence_start() {
+        let mut parser = VTParser::new();
+        let mut actor = CollectingVTActor::default();
+        let mut input = Vec::with_capacity(4 + MAX_RETAINED_BUFFER_CAPACITY * 2 + 1);
+        input.extend_from_slice(b"\x1b]0;");
+        input.extend(std::iter::repeat(b'x').take(MAX_RETAINED_BUFFER_CAPACITY * 2));
+        input.push(b'\x07');
+
+        parser.parse(&input, &mut actor);
+        assert!(parser.osc.buffer.capacity() > MAX_RETAINED_BUFFER_CAPACITY);
+
+        parser.parse(b"\x1b]1;x\x07", &mut actor);
+        assert!(parser.osc.buffer.capacity() <= MAX_RETAINED_BUFFER_CAPACITY);
     }
 
     #[test]
