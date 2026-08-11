@@ -88,7 +88,9 @@ If an image disappears after scrolling away and back, inspect the Neovim
 ID (`p=<placement_id>`), not the loop index used to remove it from the Lua
 table.  An `ENOENT` for `p=1` while the placement IDs start at 11 is a clear
 sign that the installed plugin still has this bug; update Snacks or apply the
-local compatibility patch in `lua/snacks/image/image.lua` from this checkout.
+equivalent local compatibility patch so that the loop uses
+`placement_id` for both the table lookup and the `p=` request (rather than the
+loop counter).
 When using a remote mux, also retry the image-cell lookup if the representative
 cell has scrolled away between `GetLines` and `GetImageCell`.
 
