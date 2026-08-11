@@ -417,6 +417,18 @@ struct StartNewSessionResult {
     writer: BoxedWriter,
 }
 
+const SSH_POLL_MAX_WAIT: Duration = Duration::from_millis(200);
+
+fn ssh_poll_timeout(now: Instant, deadline: Option<Instant>) -> Duration {
+    deadline
+        .map(|deadline| {
+            deadline
+                .saturating_duration_since(now)
+                .min(SSH_POLL_MAX_WAIT)
+        })
+        .unwrap_or(SSH_POLL_MAX_WAIT)
+}
+
 /// Carry out the authentication process and create the initial pty.
 fn connect_ssh_session(
     session: Session,
@@ -542,7 +554,7 @@ fn connect_ssh_session(
                     revents: 0,
                 }];
 
-                if let Ok(1) = poll(&mut pfd, Some(Duration::from_millis(200))) {
+                if let Ok(1) = poll(&mut pfd, Some(ssh_poll_timeout(Instant::now(), deadline))) {
                     let mut buf = [0u8; 64];
                     let n = self.stdin.read(&mut buf)?;
                     let input_queue = &mut self.input_queue;
@@ -1144,5 +1156,25 @@ impl std::io::Read for PtyReader {
                 _ => res,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ssh_poll_timeout, Duration, Instant, SSH_POLL_MAX_WAIT};
+
+    #[test]
+    fn ssh_poll_timeout_caps_long_waits_and_respects_short_deadlines() {
+        let now = Instant::now();
+
+        assert_eq!(ssh_poll_timeout(now, None), SSH_POLL_MAX_WAIT);
+        assert_eq!(
+            ssh_poll_timeout(now, Some(now + Duration::from_millis(50))),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            ssh_poll_timeout(now, Some(now + Duration::from_secs(1))),
+            SSH_POLL_MAX_WAIT
+        );
     }
 }
