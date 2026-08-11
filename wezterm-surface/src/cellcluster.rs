@@ -1,4 +1,5 @@
 use crate::line::CellRef;
+use alloc::borrow::Cow;
 use wezterm_bidi::{BidiContext, Direction, ParagraphDirectionHint};
 use wezterm_cell::CellAttributes;
 use wezterm_char_props::emoji::Presentation;
@@ -68,13 +69,30 @@ impl CellCluster {
             } else {
                 c.str()
             };
-            #[cfg(feature = "use_image")]
-            let mut normalized_attr = c.attrs().clone_without_kitty_unicode_images();
-            #[cfg(not(feature = "use_image"))]
-            let mut normalized_attr = c.attrs().clone();
-            if normalized_attr.wrapped() {
-                normalized_attr.set_wrapped(false);
-            }
+            let normalized_attr = {
+                #[cfg(feature = "use_image")]
+                let needs_owned_attrs = c.attrs().wrapped()
+                    || c.attrs().images_ref().is_some_and(|images| {
+                        images.iter().any(|image| {
+                            image.attachment_kind()
+                                == wezterm_cell::image::ImageCellAttachmentKind::
+                                    KittyUnicodePlaceholder
+                        })
+                    });
+                #[cfg(not(feature = "use_image"))]
+                let needs_owned_attrs = c.attrs().wrapped();
+
+                if needs_owned_attrs {
+                    #[cfg(feature = "use_image")]
+                    let mut attr_storage = c.attrs().clone_without_kitty_unicode_images();
+                    #[cfg(not(feature = "use_image"))]
+                    let mut attr_storage = c.attrs().clone();
+                    attr_storage.set_wrapped(false);
+                    Cow::Owned(attr_storage)
+                } else {
+                    Cow::Borrowed(c.attrs())
+                }
+            };
 
             last_cluster = match last_cluster.take() {
                 None => {
@@ -84,14 +102,14 @@ impl CellCluster {
                     Some(CellCluster::new(
                         hint,
                         presentation,
-                        normalized_attr.clone(),
+                        normalized_attr.clone().into_owned(),
                         cell_str,
                         cell_idx,
                         c.width(),
                     ))
                 }
                 Some(mut last) => {
-                    if last.attrs != normalized_attr || last.presentation != presentation {
+                    if last.attrs != *normalized_attr || last.presentation != presentation {
                         // Flush pending cluster and start a new one
                         clusters.push(last);
 
@@ -100,7 +118,7 @@ impl CellCluster {
                         Some(CellCluster::new(
                             hint,
                             presentation,
-                            normalized_attr.clone(),
+                            normalized_attr.clone().into_owned(),
                             cell_str,
                             cell_idx,
                             c.width(),
@@ -140,7 +158,7 @@ impl CellCluster {
                             Some(CellCluster::new(
                                 hint,
                                 presentation,
-                                normalized_attr.clone(),
+                                normalized_attr.clone().into_owned(),
                                 cell_str,
                                 cell_idx,
                                 c.width(),
