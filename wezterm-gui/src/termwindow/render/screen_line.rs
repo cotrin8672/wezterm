@@ -429,27 +429,21 @@ impl crate::TermWindow {
         // CellCluster shaping so that a grid of spaces can share one cluster.
         // Recover the image slices from the original cells here and retain
         // the style color computed for the corresponding shaped range.
-        let has_shaped_images = shaped
-            .iter()
-            .any(|item| item.cluster.attrs.images_ref().is_some());
-        if params.line.has_kitty_unicode_placeholder() || has_shaped_images {
-            let mut cell_colors = vec![None; params.line.len()];
-            for item in shaped.iter() {
-                let start = item.cluster.first_cell_idx;
-                let end = (start + item.cluster.width).min(cell_colors.len());
-                for color in &mut cell_colors[start..end] {
-                    color.replace(item.fg_color);
-                }
-            }
-
+        let has_kitty_placeholders = params.line.has_kitty_unicode_placeholder();
+        let has_shaped_images = !has_kitty_placeholders
+            && shaped
+                .iter()
+                .any(|item| item.cluster.attrs.images_ref().is_some());
+        if has_kitty_placeholders || has_shaped_images {
             for cell in params.line.visible_cells() {
                 let Some(images) = cell.attrs().images_ref() else {
                     continue;
                 };
-                let glyph_color = cell_colors
-                    .get(cell.cell_index())
-                    .and_then(|color| *color)
-                    .unwrap_or(params.foreground);
+                // Image quads set `has_color`, so the image shader samples
+                // the texture's own RGBA and does not use the glyph color.
+                // Avoid materializing a line-sized color map and walking all
+                // shaped clusters on every image-line cache miss.
+                let glyph_color = params.foreground;
                 for image in images {
                     if image.z_index() < 0 {
                         background_images.push((cell.cell_index(), image.as_ref(), glyph_color));

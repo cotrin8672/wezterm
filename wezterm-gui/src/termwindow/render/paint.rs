@@ -105,7 +105,12 @@ impl crate::TermWindow {
         }
         log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
 
-        self.call_draw(frame).ok();
+        if let Err(err) = self.call_draw(frame) {
+            // A draw failure can leave the surface or atlas out of date.  Do
+            // not silently treat it as a successful frame: retain the error
+            // context so surface-loss and device errors are diagnosable.
+            log::error!("paint draw failed: {err:#}");
+        }
         self.last_frame_duration = start.elapsed();
         log::debug!(
             "paint_impl elapsed={:?}, fps={}",

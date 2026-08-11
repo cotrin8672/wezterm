@@ -83,6 +83,15 @@ With Image B visible:
 Both images must be clipped to their Neovim windows, move with their text,
 and disappear completely when their placeholder cells are no longer visible.
 
+If an image disappears after scrolling away and back, inspect the Neovim
+`snacks.nvim` checkout.  The placement delete request must use the placement
+ID (`p=<placement_id>`), not the loop index used to remove it from the Lua
+table.  An `ENOENT` for `p=1` while the placement IDs start at 11 is a clear
+sign that the installed plugin still has this bug; update Snacks or apply the
+local compatibility patch in `lua/snacks/image/image.lua` from this checkout.
+When using a remote mux, also retry the image-cell lookup if the representative
+cell has scrolled away between `GetLines` and `GetImageCell`.
+
 ## Pass criteria
 
 - Both screenshots render as images rather than placeholder glyphs.

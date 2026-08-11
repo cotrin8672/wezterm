@@ -94,25 +94,31 @@ impl PerPane {
             return None;
         }
 
-        // Figure out what we're going to send as dirty lines vs bonus lines
+        // Figure out what we're going to send as dirty lines vs bonus lines.
+        // Do not clone the entire viewport just to discard the clean rows:
+        // placeholder cells carry image metadata and are substantially more
+        // expensive to clone than ordinary text cells.
         let viewport_range =
             dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex;
 
-        let (first_line, lines) = pane.get_lines(viewport_range);
-        let mut bonus_lines = lines
-            .into_iter()
-            .enumerate()
-            .filter_map(|(idx, mut line)| {
-                let stable_row = first_line + idx as StableRowIndex;
-                if all_dirty_lines.contains(stable_row) {
-                    all_dirty_lines.remove(stable_row);
-                    line.compress_for_scrollback();
-                    Some((stable_row, line))
-                } else {
-                    None
-                }
-            })
+        let dirty_rows_in_view = all_dirty_lines
+            .iter()
+            .flat_map(|range| range.clone())
+            .filter(|row| viewport_range.contains(row))
             .collect::<Vec<_>>();
+        let mut bonus_lines = Vec::with_capacity(dirty_rows_in_view.len() + 1);
+        for stable_row in dirty_rows_in_view {
+            all_dirty_lines.remove(stable_row);
+            // The cursor row is fetched below so that it is sent exactly once.
+            if stable_row == cursor_position.y {
+                continue;
+            }
+            let (_, mut lines) = pane.get_lines(stable_row..stable_row + 1);
+            if let Some(mut line) = lines.pop() {
+                line.compress_for_scrollback();
+                bonus_lines.push((stable_row, line));
+            }
+        }
 
         // Always send the cursor's row, as that tends to the busiest and we don't
         // have a sequencing concept for our idea of the remote state.

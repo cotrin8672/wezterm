@@ -620,7 +620,7 @@ impl Screen {
                 for (src_cell, dest_cell) in
                     cells.into_iter().zip(&mut dest_row.cells_mut()[dest_range])
                 {
-                    *dest_cell = src_cell.clone();
+                    *dest_cell = src_cell;
                 }
 
                 dest_row.fill_range(
@@ -889,7 +889,7 @@ impl Screen {
                 for (src_cell, dest_cell) in
                     cells.into_iter().zip(&mut dest_row.cells_mut()[dest_range])
                 {
-                    *dest_cell = src_cell.clone();
+                    *dest_cell = src_cell;
                 }
 
                 dest_row.fill_range(

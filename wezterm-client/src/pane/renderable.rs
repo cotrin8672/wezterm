@@ -645,47 +645,62 @@ pub(crate) async fn hydrate_lines(
     pane_id: PaneId,
     serialized_lines: SerializedLines,
 ) -> Vec<(StableRowIndex, Line)> {
+    const MAX_IMAGE_CELL_CANDIDATES: usize = 8;
     let (lines, image_cells) = serialized_lines.extract_data();
 
     if image_cells.is_empty() {
         return lines;
     }
 
-    let mut requests = HashMap::new();
+    let mut requests: HashMap<[u8; 32], Vec<GetImageCell>> = HashMap::new();
     let mut data_by_hash = HashMap::new();
     for im in &image_cells {
         if let Some(data) = IMAGE_LRU.lock().unwrap().get(&im.data_hash) {
             data_by_hash.insert(im.data_hash, Arc::clone(data));
         } else {
-            requests
-                .entry(&im.data_hash)
-                .or_insert_with(|| GetImageCell {
+            let candidates = requests.entry(im.data_hash).or_default();
+            if candidates.len() < MAX_IMAGE_CELL_CANDIDATES {
+                candidates.push(GetImageCell {
                     pane_id,
                     line_idx: im.line_idx,
                     cell_idx: im.cell_idx,
                     data_hash: im.data_hash,
                 });
+            }
         }
     }
 
-    for (_, request) in requests {
-        match client.client.get_image_cell(request).await {
-            Ok(GetImageCellResponse {
-                data: Some(data), ..
-            }) => {
-                IMAGE_LRU
-                    .lock()
-                    .unwrap()
-                    .put(data.hash(), Arc::clone(&data));
-                data_by_hash.insert(data.hash(), data);
+    for (data_hash, candidates) in requests {
+        let mut last_error = None;
+        for request in candidates {
+            match client.client.get_image_cell(request).await {
+                Ok(GetImageCellResponse {
+                    data: Some(data), ..
+                }) if data.hash() == data_hash => {
+                    IMAGE_LRU.lock().unwrap().put(data_hash, Arc::clone(&data));
+                    data_by_hash.insert(data_hash, data);
+                    last_error = None;
+                    break;
+                }
+                Ok(GetImageCellResponse {
+                    data: Some(data), ..
+                }) => {
+                    last_error = Some(format!(
+                        "image hash mismatch: requested {:?}, received {:?}",
+                        data_hash,
+                        data.hash()
+                    ));
+                }
+                Ok(GetImageCellResponse { data: None, .. }) => {
+                    last_error = Some("image cell no longer exists at candidate location".into());
+                }
+                Err(err) => {
+                    last_error = Some(format!("get image cell failed: {err:#}"));
+                }
             }
-            Ok(GetImageCellResponse { data: None, .. }) => {
-                log::error!("no image data!");
-            }
-
-            Err(err) => {
-                log::error!("failed to retrieve image {err:#}");
-            }
+        }
+        if let Some(error) = last_error {
+            log::warn!("unable to hydrate image {:?}: {}", data_hash, error);
         }
     }
 
