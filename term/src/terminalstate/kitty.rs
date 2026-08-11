@@ -63,21 +63,10 @@ struct PreparedKittyVirtualPlacement {
     cell_width: usize,
     cell_height: usize,
     geometry: Option<KittyPlaceholderGeometry>,
-    // A placeholder grid is normally small (Snacks uses at most 80x40).
-    // Cache the derived cell slices so that a placement refresh does the
-    // floating point geometry work once instead of once per cell.  Very large
-    // protocol dimensions stay on the bounded, lazy path below rather than
-    // allowing an untrusted c/r pair to allocate an enormous vector.
-    tiles: Option<Vec<Option<ImageCell>>>,
 }
 
 impl PreparedKittyVirtualPlacement {
-    fn new(
-        placement: &KittyVirtualPlacement,
-        cell_width: usize,
-        cell_height: usize,
-        cache_tiles: bool,
-    ) -> Self {
+    fn new(placement: &KittyVirtualPlacement, cell_width: usize, cell_height: usize) -> Self {
         let geometry = (|| {
             if cell_width == 0
                 || cell_height == 0
@@ -142,53 +131,18 @@ impl PreparedKittyVirtualPlacement {
             })
         })();
 
-        let mut result = Self {
+        Self {
             image_id: placement.image_id,
             placement_id: placement.placement_id,
             data: Arc::clone(&placement.data),
             cell_width,
             cell_height,
             geometry,
-            tiles: None,
-        };
-
-        if cache_tiles {
-            if let Some(geometry) = result.geometry.as_ref() {
-                const MAX_CACHED_PLACEHOLDER_TILES: usize = 65_536;
-                let tile_count = geometry
-                    .columns
-                    .checked_mul(geometry.rows)
-                    .and_then(|count| usize::try_from(count).ok())
-                    .filter(|count| *count <= MAX_CACHED_PLACEHOLDER_TILES);
-                if let Some(tile_count) = tile_count {
-                    let mut tiles = Vec::with_capacity(tile_count);
-                    for row in 0..geometry.rows {
-                        for column in 0..geometry.columns {
-                            tiles.push(result.compute_image_cell(row, column));
-                        }
-                    }
-                    result.tiles = Some(tiles);
-                }
-            }
         }
-
-        result
     }
 
     fn image_cell(&self, row: u32, column: u32) -> Option<ImageCell> {
-        if let Some(tiles) = &self.tiles {
-            let geometry = self.geometry.as_ref()?;
-            let index = row.checked_mul(geometry.columns)?.checked_add(column)?;
-            return tiles.get(usize::try_from(index).ok()?)?.clone();
-        }
         self.compute_image_cell(row, column)
-    }
-
-    fn image_cell_ref(&self, row: u32, column: u32) -> Option<&ImageCell> {
-        let tiles = self.tiles.as_ref()?;
-        let geometry = self.geometry.as_ref()?;
-        let index = row.checked_mul(geometry.columns)?.checked_add(column)?;
-        tiles.get(usize::try_from(index).ok()?)?.as_ref()
     }
 
     fn compute_image_cell(&self, row: u32, column: u32) -> Option<ImageCell> {
@@ -239,12 +193,7 @@ struct KittyPlaceholderPlacementLookup {
 }
 
 impl KittyPlaceholderPlacementLookup {
-    fn new(
-        placements: &[KittyVirtualPlacement],
-        cell_width: usize,
-        cell_height: usize,
-        cache_tiles: bool,
-    ) -> Self {
+    fn new(placements: &[KittyVirtualPlacement], cell_width: usize, cell_height: usize) -> Self {
         let mut result = Self {
             placements: Vec::with_capacity(placements.len()),
             latest_by_image_id: HashMap::with_capacity(placements.len()),
@@ -256,7 +205,6 @@ impl KittyPlaceholderPlacementLookup {
                 placement,
                 cell_width,
                 cell_height,
-                cache_tiles,
             ));
             result.latest_by_image_id.insert(placement.image_id, idx);
             if let Some(placement_id) = placement.placement_id {
@@ -491,8 +439,7 @@ fn kitty_placeholder_image_cell(
     cell_width: usize,
     cell_height: usize,
 ) -> Option<ImageCell> {
-    PreparedKittyVirtualPlacement::new(placement, cell_width, cell_height, true)
-        .image_cell(row, column)
+    PreparedKittyVirtualPlacement::new(placement, cell_width, cell_height).image_cell(row, column)
 }
 
 impl TerminalState {
@@ -527,18 +474,11 @@ impl TerminalState {
                 let requested_placement = kitty_color_id(underline);
                 match placements.resolve(image_id, requested_placement) {
                     Some(placement) => {
-                        if let Some(image) = placement.image_cell_ref(run.row, run.column) {
-                            cell.attrs_mut().replace_image_by_kind_ref(
-                                ImageCellAttachmentKind::KittyUnicodePlaceholder,
-                                Some(image),
-                            )
-                        } else {
-                            let replacement = placement.image_cell(run.row, run.column);
-                            cell.attrs_mut().replace_image_by_kind(
-                                ImageCellAttachmentKind::KittyUnicodePlaceholder,
-                                replacement,
-                            )
-                        }
+                        let replacement = placement.image_cell(run.row, run.column);
+                        cell.attrs_mut().replace_image_by_kind(
+                            ImageCellAttachmentKind::KittyUnicodePlaceholder,
+                            replacement,
+                        )
                     }
                     None => cell.attrs_mut().replace_image_by_kind(
                         ImageCellAttachmentKind::KittyUnicodePlaceholder,
@@ -575,7 +515,6 @@ impl TerminalState {
             &self.kitty_img.virtual_placements,
             cell_width,
             cell_height,
-            false,
         );
         let seqno = self.seqno;
         let mut _scan_count = 0;
@@ -629,7 +568,6 @@ impl TerminalState {
             &self.kitty_img.virtual_placements,
             cell_width,
             cell_height,
-            false,
         );
         let mut _scan_count = 0;
         let mut _cell_scan_count = 0;
@@ -1911,9 +1849,9 @@ mod unicode_placeholder_test {
             image_height: 100,
             data,
         };
-        let prepared = PreparedKittyVirtualPlacement::new(&placement, 10, 20, true);
+        let prepared = PreparedKittyVirtualPlacement::new(&placement, 10, 20);
         let geometry = prepared.geometry.as_ref().unwrap();
         assert_eq!((geometry.columns, geometry.rows), (20, 10));
-        assert!(prepared.tiles.is_some());
+        assert!(prepared.image_cell(0, 0).is_some());
     }
 }
