@@ -6615,6 +6615,7 @@ dependencies = [
 name = "vtparse"
 version = "0.7.0"
 dependencies = [
+ "criterion",
  "heapless",
  "k9",
  "utf8parse",

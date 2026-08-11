@@ -21,4 +21,9 @@ heapless = {workspace = true, optional = true }
 utf8parse.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 k9.workspace = true
+
+[[bench]]
+name = "parser"
+harness = false
