@@ -1,8 +1,8 @@
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::termwindow::render::{
     resolve_fg_color_attr, same_hyperlink, update_next_frame_time, ClusterStyleCache,
-    ComputeCellFgBgParams, ComputeCellFgBgResult, LineToElementParams, LineToElementShape,
-    RenderScreenLineParams, RenderScreenLineResult,
+    ComputeCellFgBgParams, ComputeCellFgBgResult, ImageRenderCache, LineToElementParams,
+    LineToElementShape, RenderScreenLineParams, RenderScreenLineResult,
 };
 use crate::termwindow::LineToElementShapeItem;
 use ::window::DeadKeyStatus;
@@ -23,10 +23,11 @@ impl crate::TermWindow {
     /// This is nominally a matter of setting the fg/bg color and the
     /// texture coordinates for a given glyph.  There's a little bit
     /// of extra complexity to deal with multi-cell glyphs.
-    pub fn render_screen_line(
+    pub(crate) fn render_screen_line(
         &self,
         params: RenderScreenLineParams,
         layers: &mut TripleLayerQuadAllocator,
+        image_cache: &mut ImageRenderCache,
     ) -> anyhow::Result<RenderScreenLineResult> {
         if params.line.is_double_height_bottom() {
             // The top and bottom lines are required to have the same content.
@@ -38,6 +39,7 @@ impl crate::TermWindow {
         }
 
         let gl_state = self.render_state.as_ref().unwrap();
+        let image_padding = self.image_padding(&params);
 
         let num_cols = params.dims.cols;
 
@@ -420,6 +422,7 @@ impl crate::TermWindow {
             }
         }
 
+        let mut background_images = vec![];
         let mut overlay_images = vec![];
 
         // Number of cells we've rendered, starting from the edge of the line
@@ -471,16 +474,11 @@ impl crate::TermWindow {
                 for glyph_idx in 0..info.pos.num_cells as usize {
                     for img in images {
                         if img.z_index() < 0 {
-                            self.populate_image_quad(
-                                img,
-                                gl_state,
-                                layers,
-                                0,
+                            background_images.push((
                                 visual_cell_idx + glyph_idx,
-                                &params,
-                                hsv,
+                                img.as_ref(),
                                 item.fg_color,
-                            )?;
+                            ));
                         }
                     }
                 }
@@ -668,7 +666,7 @@ impl crate::TermWindow {
                         if img.z_index() >= 0 {
                             overlay_images.push((
                                 visual_cell_idx + glyph_idx,
-                                img.clone(),
+                                img.as_ref(),
                                 item.fg_color,
                             ));
                         }
@@ -699,18 +697,98 @@ impl crate::TermWindow {
             }
         }
 
+        fn can_batch_image_cells(
+            prev: &(usize, &termwiz::image::ImageCell, LinearRgba),
+            next: &(usize, &termwiz::image::ImageCell, LinearRgba),
+        ) -> bool {
+            let (prev_idx, prev_image, _) = prev;
+            let (next_idx, next_image, _) = next;
+            if *next_idx != *prev_idx + 1
+                || prev_image.image_data().hash() != next_image.image_data().hash()
+                || prev_image.z_index() != next_image.z_index()
+                || prev_image.image_id() != next_image.image_id()
+                || prev_image.placement_id() != next_image.placement_id()
+                || prev_image.attachment_kind()
+                    != termwiz::image::ImageCellAttachmentKind::KittyUnicodePlaceholder
+                || next_image.attachment_kind()
+                    != termwiz::image::ImageCellAttachmentKind::KittyUnicodePlaceholder
+            {
+                return false;
+            }
+
+            let (_prev_left, prev_top, prev_right, prev_bottom) = prev_image.padding();
+            let (next_left, next_top, _next_right, next_bottom) = next_image.padding();
+            let prev_top_left = prev_image.top_left();
+            let prev_bottom_right = prev_image.bottom_right();
+            let next_top_left = next_image.top_left();
+            let next_bottom_right = next_image.bottom_right();
+
+            prev_right == 0
+                && next_left == 0
+                && prev_top == next_top
+                && prev_bottom == next_bottom
+                && prev_top_left.y == next_top_left.y
+                && prev_bottom_right.y == next_bottom_right.y
+                && prev_bottom_right.x == next_top_left.x
+        }
+
+        if self.allow_images != crate::termwindow::render::paint::AllowImage::No {
+            let mut start = 0;
+            while start < background_images.len() {
+                let mut end = start + 1;
+                while end < background_images.len()
+                    && direction == Direction::LeftToRight
+                    && can_batch_image_cells(&background_images[end - 1], &background_images[end])
+                {
+                    end += 1;
+                }
+
+                let first = &background_images[start];
+                let last = &background_images[end - 1];
+                let (sprite, next_due) = image_cache
+                    .cached_image(gl_state, first.1, image_padding, self.allow_images)
+                    .context("cached_image")?;
+                self.update_next_frame_time(next_due);
+                if end - start == 1 {
+                    self.populate_image_quad_with_sprite(
+                        first.1, &sprite, layers, 0, first.0, &params, hsv, first.2,
+                    )?;
+                } else {
+                    self.populate_image_run_with_sprite(
+                        first.1,
+                        last.1,
+                        &sprite,
+                        layers,
+                        0,
+                        first.0,
+                        end - start,
+                        &params,
+                        hsv,
+                        first.2,
+                    )?;
+                }
+                start = end;
+            }
+        }
+
         for (cell_idx, img, glyph_color) in overlay_images {
-            self.populate_image_quad(
-                &img,
-                gl_state,
-                layers,
-                2,
-                phys(cell_idx, num_cols, direction),
-                &params,
-                hsv,
-                glyph_color,
-            )
-            .context("populate_image_quad")?;
+            if self.allow_images != crate::termwindow::render::paint::AllowImage::No {
+                let (sprite, next_due) = image_cache
+                    .cached_image(gl_state, img, image_padding, self.allow_images)
+                    .context("cached_image")?;
+                self.update_next_frame_time(next_due);
+                self.populate_image_quad_with_sprite(
+                    img,
+                    &sprite,
+                    layers,
+                    2,
+                    phys(cell_idx, num_cols, direction),
+                    &params,
+                    hsv,
+                    glyph_color,
+                )
+                .context("populate_image_quad")?;
+            }
         }
 
         metrics::histogram!("render_screen_line").record(start.elapsed());

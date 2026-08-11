@@ -1041,6 +1041,11 @@ impl Line {
             self.set_cell_impl(x, cell.clone(), true, seqno);
         }
         self.prune_trailing_blanks(seqno);
+        // Erases deliberately clear image placements and can leave a stale
+        // placeholder bit behind if the line used to contain U+10EEEE.
+        // Keep the candidate marker exact so a later placement refresh does
+        // not rescan an erased line.
+        self.recompute_kitty_unicode_placeholder_flag();
     }
 
     pub fn len(&self) -> usize {

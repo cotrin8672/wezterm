@@ -1,5 +1,5 @@
 use crate::quad::TripleLayerQuadAllocator;
-use crate::termwindow::render::RenderScreenLineParams;
+use crate::termwindow::render::{ImageRenderCache, RenderScreenLineParams};
 use crate::utilsprites::RenderMetrics;
 use config::ConfigHandle;
 use mux::renderable::RenderableDimensions;
@@ -57,6 +57,7 @@ impl crate::TermWindow {
                 self.config.text_background_opacity
             });
 
+        let mut image_cache = ImageRenderCache::default();
         self.render_screen_line(
             RenderScreenLineParams {
                 top_pixel_y: tab_bar_y,
@@ -101,6 +102,7 @@ impl crate::TermWindow {
                 password_input: false,
             },
             layers,
+            &mut image_cache,
         )?;
 
         Ok(())

@@ -180,6 +180,34 @@ fn kitty_placeholder_noop_refresh_does_not_rebuild_attachments() {
 }
 
 #[test]
+fn kitty_placeholder_redraw_reuses_existing_attachment() {
+    let mut term = TestTerm::new(2, 8, 0);
+    let transmit = format!(
+        "\x1b_Ga=T,t=d,f=100,i=1,U=1,c=1,r=1,q=2;{}\x1b\\",
+        TINY_PNG_BASE64
+    );
+    let placeholder = "\x1b[38;5;1m\u{10eeee}\u{0305}\u{0305}";
+    term.print(transmit);
+    term.print(placeholder.as_bytes());
+    let before = term.term.kitty_placeholder_refresh_stats();
+
+    // Neovim can redraw the same virtual text without changing its decoded
+    // image cell.  Rewriting the placeholder must not allocate and attach a
+    // replacement ImageCell just because the terminal cell was written again.
+    term.print(format!("\r{placeholder}").as_bytes());
+
+    let after = term.term.kitty_placeholder_refresh_stats();
+    k9::assert_equal!(after.2, before.2);
+    assert!(term.term.screen().visible_lines()[0]
+        .visible_cells()
+        .next()
+        .unwrap()
+        .attrs()
+        .images()
+        .is_some());
+}
+
+#[test]
 fn kitty_placeholder_overwrite_clears_line_candidate_bit() {
     let mut term = TestTerm::new(2, 8, 0);
     let transmit = format!(
@@ -191,13 +219,12 @@ fn kitty_placeholder_overwrite_clears_line_candidate_bit() {
     term.print("\rX");
     let after_overwrite = term.term.kitty_placeholder_refresh_stats();
 
-    // EL force-scans its affected row so that direct cell-slice mutations can
-    // repair a false-negative line flag.  The cleared row is scanned once,
-    // but must not recreate an attachment.
+    // EL marks only the current row.  Since the row's exact placeholder bit
+    // was cleared by the overwrite, the normal edit path skips its scan.
     term.print("\x1b[2K");
     let after_edit = term.term.kitty_placeholder_refresh_stats();
-    k9::assert_equal!(after_edit.0 - after_overwrite.0, 1);
-    k9::assert_equal!(after_edit.1 - after_overwrite.1, 8);
+    k9::assert_equal!(after_edit.0, after_overwrite.0);
+    k9::assert_equal!(after_edit.1, after_overwrite.1);
     k9::assert_equal!(after_edit.2, after_overwrite.2);
 }
 
@@ -213,12 +240,20 @@ fn kitty_placeholder_line_edit_scans_only_the_affected_row() {
     term.print(format!("{placeholder}\r\n{placeholder}"));
     let before = term.term.kitty_placeholder_refresh_stats();
 
-    // EL is common in Neovim redraws.  It changes only the cursor row, so it
-    // must not scan the other placeholder row or the rest of scrollback.
+    // EL is common in Neovim redraws.  The erase path removes the derived
+    // attachment and recomputes the line candidate bit directly, so it does
+    // not need to invoke the placeholder scanner at all.
     term.print("\x1b[1;1H\x1b[2K");
 
     let after = term.term.kitty_placeholder_refresh_stats();
-    k9::assert_equal!(after.0 - before.0, 1);
+    k9::assert_equal!(after, before);
+    assert!(term.term.screen().visible_lines()[0]
+        .visible_cells()
+        .next()
+        .unwrap()
+        .attrs()
+        .images()
+        .is_none());
     assert!(term.term.screen().visible_lines()[1]
         .visible_cells()
         .next()

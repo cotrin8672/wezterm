@@ -1,4 +1,4 @@
-# Kitty Unicode Placeholder Manual Test
+vim.g.loaded_netrw = 1
 
 The image below must be visible directly under this title as soon as the test
 opens. If only the Markdown alt text is visible, the test has failed.
@@ -52,15 +52,15 @@ leave stale fragments behind.
 
 ## Spacer for viewport movement
 
-01. Scroll across this line.
-02. Scroll across this line.
-03. Scroll across this line.
-04. Scroll across this line.
-05. Scroll across this line.
-06. Scroll across this line.
-07. Scroll across this line.
-08. Scroll across this line.
-09. Scroll across this line.
+1.  Scroll across this line.
+2.  Scroll across this line.
+3.  Scroll across this line.
+4.  Scroll across this line.
+5.  Scroll across this line.
+6.  Scroll across this line.
+7.  Scroll across this line.
+8.  Scroll across this line.
+9.  Scroll across this line.
 10. Scroll across this line.
 11. Scroll across this line.
 12. Scroll across this line.

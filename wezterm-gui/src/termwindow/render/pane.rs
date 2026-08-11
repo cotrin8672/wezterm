@@ -2,8 +2,8 @@ use crate::quad::{HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator};
 use crate::selection::SelectionRange;
 use crate::termwindow::box_model::*;
 use crate::termwindow::render::{
-    same_hyperlink, CursorProperties, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
-    RenderScreenLineParams,
+    same_hyperlink, CursorProperties, ImageRenderCache, LineQuadCacheKey, LineQuadCacheValue,
+    LineToEleShapeCacheKey, RenderScreenLineParams,
 };
 use crate::termwindow::{ScrollHit, UIItem, UIItemType};
 use ::window::bitmaps::TextureRect;
@@ -334,6 +334,7 @@ impl crate::TermWindow {
                 filled_box: TextureRect,
                 window_is_transparent: bool,
                 layers: &'a mut TripleLayerQuadAllocator<'b>,
+                image_cache: ImageRenderCache,
                 error: Option<anyhow::Error>,
             }
 
@@ -364,6 +365,7 @@ impl crate::TermWindow {
                 filled_box,
                 window_is_transparent,
                 layers,
+                image_cache: ImageRenderCache::default(),
                 error: None,
             };
 
@@ -525,6 +527,7 @@ impl crate::TermWindow {
                                 password_input,
                             },
                             &mut TripleLayerQuadAllocator::Heap(&mut buf),
+                            &mut self.image_cache,
                         )
                         .context("render_screen_line")?;
 

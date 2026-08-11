@@ -25,7 +25,19 @@ impl VecStorage {
         if !clear_image_placement {
             if let Some(images) = self.cells[idx].attrs().images_ref() {
                 for image in images {
-                    if image.should_preserve_on_cell_update() {
+                    // Kitty Unicode placeholders are re-emitted during an
+                    // ordinary terminal redraw. Keep the derived attachment
+                    // while the replacement cell is still the placeholder;
+                    // the terminal's row scanner will replace it only when
+                    // the decoded placeholder metadata actually changes.
+                    // This avoids rebuilding the same ImageCell on every
+                    // redraw, while normal text still removes the image.
+                    if image.should_preserve_on_cell_update()
+                        || (cell.str().starts_with('\u{10eeee}')
+                            && image.attachment_kind()
+                                == wezterm_cell::image::ImageCellAttachmentKind::
+                                    KittyUnicodePlaceholder)
+                    {
                         cell.attrs_mut()
                             .attach_image(Box::new(image.as_ref().clone()));
                     }

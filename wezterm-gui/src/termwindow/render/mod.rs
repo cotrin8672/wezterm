@@ -9,6 +9,7 @@ use crate::shapecache::*;
 use crate::termwindow::render::paint::AllowImage;
 use crate::termwindow::{BorrowedShapeCacheKey, RenderState, ShapedInfo, TermWindowNotif};
 use crate::utilsprites::RenderMetrics;
+use ::window::bitmaps::atlas::Sprite;
 use ::window::bitmaps::{TextureCoord, TextureRect, TextureSize};
 use ::window::{DeadKeyStatus, PointF, RectF, SizeF, WindowOps};
 use anyhow::{anyhow, Context};
@@ -20,6 +21,7 @@ use euclid::num::Zero;
 use mux::pane::{Pane, PaneId};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use ordered_float::NotNan;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -168,6 +170,40 @@ pub struct RenderScreenLineParams<'a> {
     pub render_metrics: RenderMetrics,
     pub shape_key: Option<LineToEleShapeCacheKey>,
     pub password_input: bool,
+}
+
+/// Images resolved during one paint pass.  A placeholder grid can reference
+/// the same image hundreds of times; resolving the atlas sprite for every
+/// cell adds RefCell, hash-map and animation bookkeeping overhead without
+/// changing the result.  The cache is deliberately scoped to a paint pass so
+/// that atlas recreation and animation frame changes cannot leave stale
+/// sprites behind.
+#[derive(Default)]
+pub(crate) struct ImageRenderCache {
+    sprites: HashMap<[u8; 32], (Sprite, Option<Instant>)>,
+}
+
+impl ImageRenderCache {
+    fn cached_image<'a>(
+        &'a mut self,
+        gl_state: &RenderState,
+        image: &termwiz::image::ImageCell,
+        padding: usize,
+        allow_image: AllowImage,
+    ) -> anyhow::Result<(&'a Sprite, Option<Instant>)> {
+        let key = image.image_data().hash();
+        if !self.sprites.contains_key(&key) {
+            let (sprite, next_due, _load_state) = gl_state
+                .glyph_cache
+                .borrow_mut()
+                .cached_image(image.image_data(), Some(padding), allow_image)
+                .context("cached_image")?;
+            self.sprites.insert(key, (sprite, next_due));
+        }
+
+        let (sprite, next_due) = self.sprites.get(&key).expect("image cache entry");
+        Ok((sprite, *next_due))
+    }
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -438,10 +474,23 @@ impl crate::TermWindow {
     }
 
     /// Render iTerm2 style image attributes
-    pub fn populate_image_quad(
+    pub(crate) fn image_padding(&self, params: &RenderScreenLineParams) -> usize {
+        let padding = self
+            .render_metrics
+            .cell_size
+            .height
+            .max(params.render_metrics.cell_size.width) as usize;
+        if padding.is_power_of_two() {
+            padding
+        } else {
+            padding.next_power_of_two()
+        }
+    }
+
+    pub(crate) fn populate_image_quad_with_sprite(
         &self,
         image: &termwiz::image::ImageCell,
-        gl_state: &RenderState,
+        sprite: &Sprite,
         layers: &mut TripleLayerQuadAllocator,
         layer_num: usize,
         cell_idx: usize,
@@ -453,23 +502,6 @@ impl crate::TermWindow {
             return Ok(());
         }
 
-        let padding = self
-            .render_metrics
-            .cell_size
-            .height
-            .max(params.render_metrics.cell_size.width) as usize;
-        let padding = if padding.is_power_of_two() {
-            padding
-        } else {
-            padding.next_power_of_two()
-        };
-
-        let (sprite, next_due, _load_state) = gl_state
-            .glyph_cache
-            .borrow_mut()
-            .cached_image(image.image_data(), Some(padding), self.allow_images)
-            .context("cached_image")?;
-        self.update_next_frame_time(next_due);
         let width = sprite.coords.size.width;
         let height = sprite.coords.size.height;
 
@@ -518,6 +550,100 @@ impl crate::TermWindow {
         quad.set_has_color(true);
 
         Ok(())
+    }
+
+    /// Render a horizontally contiguous run of cells that slice the same
+    /// image. Kitty placeholder grids commonly contain dozens of such cells
+    /// per row; one quad for the whole run has the same texture mapping and
+    /// avoids rebuilding a quad for every cell.
+    pub(crate) fn populate_image_run_with_sprite(
+        &self,
+        first: &termwiz::image::ImageCell,
+        last: &termwiz::image::ImageCell,
+        sprite: &Sprite,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        first_cell_idx: usize,
+        cell_count: usize,
+        params: &RenderScreenLineParams,
+        hsv: Option<config::HsbTransform>,
+        glyph_color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        if self.allow_images == AllowImage::No {
+            return Ok(());
+        }
+
+        let width = sprite.coords.size.width;
+        let height = sprite.coords.size.height;
+        let top_left = first.top_left();
+        let bottom_right = last.bottom_right();
+        let texture_width = sprite.texture.width() as f32;
+        let texture_height = sprite.texture.height() as f32;
+        let origin = TextureCoord::new(
+            (sprite.coords.origin.x as f32 + (*top_left.x * width as f32)) / texture_width,
+            (sprite.coords.origin.y as f32 + (*top_left.y * height as f32)) / texture_height,
+        );
+        let size = TextureSize::new(
+            (*bottom_right.x - *top_left.x) * width as f32 / texture_width,
+            (*bottom_right.y - *top_left.y) * height as f32 / texture_height,
+        );
+        let texture_rect = TextureRect::new(origin, size);
+
+        let mut quad = layers.allocate(layer_num)?;
+        let cell_width = params.render_metrics.cell_size.width as f32;
+        let cell_height = params.render_metrics.cell_size.height as f32;
+        let pos_y = (self.dimensions.pixel_height as f32 / -2.) + params.top_pixel_y;
+        let pos_x = (self.dimensions.pixel_width as f32 / -2.)
+            + params.left_pixel_x
+            + (first_cell_idx as f32 * cell_width);
+        let (padding_left, padding_top, _, _) = first.padding();
+        let (_, _, padding_right, padding_bottom) = last.padding();
+
+        quad.set_position(
+            pos_x + padding_left as f32,
+            pos_y + padding_top as f32,
+            pos_x + cell_count as f32 * cell_width + padding_left as f32 - padding_right as f32,
+            pos_y + cell_height + padding_top as f32 - padding_bottom as f32,
+        );
+        quad.set_hsv(hsv);
+        quad.set_fg_color(glyph_color);
+        quad.set_texture(texture_rect);
+        quad.set_has_color(true);
+        Ok(())
+    }
+
+    pub fn populate_image_quad(
+        &self,
+        image: &termwiz::image::ImageCell,
+        gl_state: &RenderState,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        cell_idx: usize,
+        params: &RenderScreenLineParams,
+        hsv: Option<config::HsbTransform>,
+        glyph_color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        if self.allow_images == AllowImage::No {
+            return Ok(());
+        }
+
+        let padding = self.image_padding(params);
+        let (sprite, next_due, _load_state) = gl_state
+            .glyph_cache
+            .borrow_mut()
+            .cached_image(image.image_data(), Some(padding), self.allow_images)
+            .context("cached_image")?;
+        self.update_next_frame_time(next_due);
+        self.populate_image_quad_with_sprite(
+            image,
+            &sprite,
+            layers,
+            layer_num,
+            cell_idx,
+            params,
+            hsv,
+            glyph_color,
+        )
     }
 
     fn ensure_min_contrast(&self, fg_color: LinearRgba, bg_color: LinearRgba) -> LinearRgba {

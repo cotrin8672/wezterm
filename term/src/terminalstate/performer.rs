@@ -21,7 +21,8 @@ use wezterm_cell::{
     grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
 };
 use wezterm_escape_parser::csi::{
-    CharacterPath, Edit, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
+    CharacterPath, DecPrivateMode, DecPrivateModeCode, Edit, EraseInDisplay, Keyboard,
+    KittyKeyboardFlags, KittyKeyboardMode, Mode,
 };
 use wezterm_escape_parser::osc::{
     ChangeColorPair, ColorOrQuery, FinalTermSemanticPrompt, ITermProprietary,
@@ -37,6 +38,7 @@ pub(crate) struct Performer<'a> {
     pub state: &'a mut TerminalState,
     print: String,
     kitty_placeholder_dirty_rows: HashSet<StableRowIndex>,
+    kitty_placeholder_force_dirty_rows: HashSet<StableRowIndex>,
     kitty_placeholder_full_refresh: bool,
 }
 
@@ -67,22 +69,52 @@ impl<'a> Performer<'a> {
             state,
             print: String::new(),
             kitty_placeholder_dirty_rows: HashSet::new(),
+            kitty_placeholder_force_dirty_rows: HashSet::new(),
             kitty_placeholder_full_refresh: false,
         }
     }
 
     fn reconcile_kitty_unicode_placeholders(&mut self) {
-        if !self.kitty_placeholder_dirty_rows.is_empty() {
+        if !self.kitty_placeholder_force_dirty_rows.is_empty() {
+            self.state
+                .refresh_kitty_unicode_placeholders_in_stable_rows(
+                    &self.kitty_placeholder_force_dirty_rows,
+                    true,
+                );
+        }
+        if !self.kitty_placeholder_full_refresh && !self.kitty_placeholder_dirty_rows.is_empty() {
             self.state
                 .refresh_kitty_unicode_placeholders_in_stable_rows(
                     &self.kitty_placeholder_dirty_rows,
+                    false,
                 );
         }
         if self.kitty_placeholder_full_refresh {
             self.state.refresh_kitty_unicode_placeholders();
         }
         self.kitty_placeholder_dirty_rows.clear();
+        self.kitty_placeholder_force_dirty_rows.clear();
         self.kitty_placeholder_full_refresh = false;
+    }
+
+    fn mode_switches_alternate_screen(csi: &CSI) -> bool {
+        let mode = match csi {
+            CSI::Mode(mode) => mode,
+            _ => return false,
+        };
+        let private_mode = match mode {
+            Mode::SetDecPrivateMode(mode) | Mode::ResetDecPrivateMode(mode) => mode,
+            _ => return false,
+        };
+        match private_mode {
+            DecPrivateMode::Code(code) => matches!(
+                code,
+                DecPrivateModeCode::EnableAlternateScreen
+                    | DecPrivateModeCode::OptEnableAlternateScreen
+                    | DecPrivateModeCode::ClearAndEnableAlternateScreen
+            ),
+            DecPrivateMode::Unspecified(code) => matches!(*code, 47 | 1047 | 1049),
+        }
     }
 
     fn mark_partial_width_scroll_rows_dirty(&mut self) {
@@ -100,7 +132,8 @@ impl<'a> Performer<'a> {
                 })
                 .collect()
         };
-        self.kitty_placeholder_dirty_rows.extend(affected_rows);
+        self.kitty_placeholder_force_dirty_rows
+            .extend(affected_rows);
     }
 
     /// Apply character set related remapping to the input glyph if required
@@ -568,7 +601,7 @@ impl<'a> Performer<'a> {
                 Edit::DeleteLine(_) | Edit::InsertLine(_) | Edit::ScrollDown(_) | Edit::ScrollUp(_),
             )
         );
-        let may_switch_screen = matches!(&csi, CSI::Mode(_));
+        let may_switch_screen = Self::mode_switches_alternate_screen(&csi);
         if line_scroll || may_switch_screen {
             self.reconcile_kitty_unicode_placeholders();
         }
@@ -590,8 +623,11 @@ impl<'a> Performer<'a> {
             }
             _ => None,
         };
-        let kitty_full_refresh =
-            matches!(&csi, CSI::Edit(Edit::EraseInDisplay(_) | Edit::Repeat(_)));
+        // Erases clear the affected cells (and their derived attachments)
+        // directly.  Only REP can copy a placeholder grapheme to a new
+        // location without an ordinary print path, so it still needs the
+        // conservative full reconciliation.
+        let kitty_full_refresh = matches!(&csi, CSI::Edit(Edit::Repeat(_)));
         match csi {
             CSI::Sgr(sgr) => self.state.perform_csi_sgr(sgr),
             CSI::Cursor(wezterm_escape_parser::csi::Cursor::Left(n)) => {

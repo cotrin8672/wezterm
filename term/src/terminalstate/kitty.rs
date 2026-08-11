@@ -509,6 +509,7 @@ impl TerminalState {
     pub(crate) fn refresh_kitty_unicode_placeholders_in_stable_rows(
         &mut self,
         stable_rows: &HashSet<StableRowIndex>,
+        force_scan: bool,
     ) {
         if stable_rows.is_empty() {
             return;
@@ -534,7 +535,7 @@ impl TerminalState {
                 self.screen_mut().line_mut(physical_row),
                 &placements,
                 seqno,
-                true,
+                force_scan,
             );
             if cells_scanned > 0 {
                 _scan_count += 1;
