@@ -343,8 +343,12 @@ impl HarfbuzzShaper {
         let hb_infos = buf.glyph_infos();
         let positions = buf.glyph_positions();
 
-        let mut cluster = Vec::with_capacity(s.len());
-        let mut info_clusters: Vec<Vec<Info>> = Vec::with_capacity(s.len());
+        // The UTF-8 byte length can be substantially larger than the number
+        // of glyphs/clusters (for example, for CJK or emoji input).  Reserve
+        // against the shaping result instead of the input byte length; both
+        // vectors still grow normally when fallback shaping expands a run.
+        let mut cluster = Vec::with_capacity(hb_infos.len());
+        let mut info_clusters: Vec<Vec<Info>> = Vec::with_capacity(hb_infos.len());
 
         // At this point we have a list of glyphs from the shaper.
         // Each glyph will have `info.cluster` set to the byte index
