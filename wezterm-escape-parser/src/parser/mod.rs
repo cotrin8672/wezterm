@@ -128,34 +128,33 @@ impl Parser {
     /// that was recognized and the length of the byte stream that was fed in
     /// to the parser to yield it.
     pub fn parse_first(&mut self, bytes: &[u8]) -> Option<(Action, usize)> {
-        // holds the first action.  We need to use RefCell to deal with
-        // the Performer holding a reference to this via the closure we set up.
-        let first = RefCell::new(None);
+        // Holds the first action seen by the callback.
+        let mut first = None;
         // will hold the iterator index when we emit an action
         let mut first_idx = None;
-        {
-            let mut perform = Performer {
-                callback: &mut |action| {
-                    // capture the action, but only if it is the first one
-                    // we've seen.  Preserve an existing one if any.
-                    if first.borrow().is_some() {
-                        return;
-                    }
-                    *first.borrow_mut() = Some(action);
-                },
-                state: &mut self.state.borrow_mut(),
-            };
-            for (idx, b) in bytes.iter().enumerate() {
+        let mut parser_state = self.state.borrow_mut();
+        for (idx, b) in bytes.iter().enumerate() {
+            {
+                let mut perform = Performer {
+                    callback: &mut |action| {
+                        // capture the action, but only if it is the first one
+                        // we've seen.  Preserve an existing one if any.
+                        if first.is_none() {
+                            first = Some(action);
+                        }
+                    },
+                    state: &mut parser_state,
+                };
                 self.state_machine.parse_byte(*b, &mut perform);
-                if first.borrow().is_some() {
-                    // if we recognized an action, record the iterator index
-                    first_idx = Some(idx);
-                    break;
-                }
+            }
+            if first.is_some() {
+                // if we recognized an action, record the iterator index
+                first_idx = Some(idx);
+                break;
             }
         }
 
-        match (first.into_inner(), first_idx) {
+        match (first, first_idx) {
             // if we matched an action, transform the iterator index to
             // the length of the string that was consumed (+1)
             (Some(action), Some(idx)) => Some((action, idx + 1)),
@@ -175,12 +174,13 @@ impl Parser {
     pub fn parse_first_as_vec(&mut self, bytes: &[u8]) -> Option<(Vec<Action>, usize)> {
         let mut actions = Vec::new();
         let mut first_idx = None;
+        let mut parser_state = self.state.borrow_mut();
         for (idx, b) in bytes.iter().enumerate() {
             self.state_machine.parse_byte(
                 *b,
                 &mut Performer {
                     callback: &mut |action| actions.push(action),
-                    state: &mut self.state.borrow_mut(),
+                    state: &mut parser_state,
                 },
             );
             if !actions.is_empty() && self.state_machine.is_ground() {
@@ -364,6 +364,14 @@ mod test {
             write!(res, "{}", s).unwrap();
         }
         String::from_utf8(res).unwrap()
+    }
+
+    #[test]
+    fn parse_first_stops_after_first_action() {
+        let mut parser = Parser::new();
+
+        assert_eq!(parser.parse_first(b"ab"), Some((Action::Print('a'), 1)));
+        assert_eq!(parser.parse_first(b"b"), Some((Action::Print('b'), 1)));
     }
 
     // <https://github.com/markbt/streampager/issues/57>
