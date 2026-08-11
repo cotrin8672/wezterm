@@ -1,15 +1,15 @@
 {
-  "version": "20260811-120426-774ce72a",
+  "version": "20260812-013608-8d432c3",
   "description": "WezTerm with Kitty Unicode placeholder support",
   "homepage": "https://github.com/cotrin8672/wezterm",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/cotrin8672/wezterm/releases/download/20260811-120426-774ce72a/WezTerm-windows-20260811-120426-774ce72a.zip",
-      "hash": "f8da80d6af0c5ae9b8756e7d26dd308955f8c21dd06fa8d744878cb50e90d3b3"
+      "url": "https://github.com/cotrin8672/wezterm/releases/download/20260812-013608-8d432c3/WezTerm-windows-20260812-013608-8d432c3.zip",
+      "hash": "7c56a5fc629b29018f162a700ae6a3f9a860bb62d5663bc3d56790b0f8fdd143"
     }
   },
-  "extract_dir": "WezTerm-windows-20260811-120426-774ce72a",
+  "extract_dir": "WezTerm-windows-20260812-013608-8d432c3",
   "bin": [
     ["wezterm.exe", "wezterm"],
     ["wezterm-gui.exe", "wezterm-gui"]
